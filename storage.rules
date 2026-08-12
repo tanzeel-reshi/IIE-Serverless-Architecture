@@ -1,0 +1,352 @@
+// ============================================================
+// FIREBASE STORAGE SECURITY RULES — IIE Educational Management Platform
+// ============================================================
+// SANITIZED FOR PORTFOLIO — All project-specific identifiers
+// and domain names have been replaced with placeholders.
+//
+// Architectural patterns demonstrated:
+//   - Cross-service Firestore role lookups from Storage rules
+//   - Path-scoped owner isolation for private files
+//   - Content-type enforcement with extension fallbacks
+//   - Per-path file size limits
+//   - Time-limited delegation flag checks
+//   - Form-teacher scoping (teacher can only access their own group photos)
+// ============================================================
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        userDoc().data.role == 'Admin' ||
+        (userDoc().data.roles is list && userDoc().data.roles.hasAny(['Admin']))
+      );
+    }
+
+    function isStaff() {
+      return isSignedIn() && (
+        userDoc().data.role == 'Admin' ||
+        userDoc().data.role == 'ProgramOrganizer' ||
+        userDoc().data.role == 'Finance' ||
+        (userDoc().data.roles is list && userDoc().data.roles.hasAny(['Admin', 'ProgramOrganizer', 'Finance', 'Manager', 'Assistant']))
+      );
+    }
+
+    function hasActiveDelegation(flag) {
+      return isSignedIn()
+        && (userDoc().data.tempPermissions is map)
+        && (userDoc().data.tempPermissions[flag] == true)
+        && (userDoc().data.tempPermissions.expiresAt is timestamp)
+        && (userDoc().data.tempPermissions.expiresAt > request.time);
+    }
+
+    // NOTE: This ruleset uses Firestore-backed checks (cross-service rules).
+    // Firebase may prompt to grant an IAM role required for these checks.
+    // Gallery images: public read, authenticated image uploads/deletes
+    match /gallery/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && (
+                     // Delete (no request.resource on delete)
+                     request.resource == null ||
+                     // Create/Update with explicit image content type
+                     (request.resource != null && request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+                     // Fallback: allow by extension if contentType missing
+                     (request.resource != null && request.resource.name.matches('gallery/.+\\.(?i)(jpe?g|png|webp)$'))
+                   );
+    }
+
+    // Feedback attachments: public read (unguessable URLs), public upload (for anonymous feedback)
+    match /feedback-attachments/{allPaths=**} {
+      allow read: if true;
+      allow create: if request.resource.size < 6 * 1024 * 1024;
+      allow update, delete: if isAdmin();
+    }
+
+    // Event posters: public read, authenticated image uploads/deletes
+    match /event_posters/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && (
+                     // Delete (no request.resource on delete)
+                     request.resource == null ||
+                     // Create/Update with explicit image content type
+                     (request.resource != null && request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+                     // Fallback: allow by extension if contentType missing
+                     (request.resource != null && request.resource.name.matches('event_posters/.+\\.(?i)(jpe?g|png|webp)$'))
+                   );
+    }
+
+    // Official ID uploads (private): path officialIds/{uid}/official-id.(jpg|png|webp|pdf)
+    match /officialIds/{userUid}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userUid; // only owner can read
+      allow write: if request.auth != null && request.auth.uid == userUid && (
+        // Allow limited content types (images or pdf) and size <= 5MB
+        (
+          resource == null &&
+          request.resource != null &&
+          request.resource.size < 1 * 1024 * 1024 && // 1MB cap
+          (
+            (request.resource.contentType != null && (
+              request.resource.contentType.matches('image/.+') ||
+              request.resource.contentType == 'application/pdf'
+            )) ||
+            // Fallback by extension if contentType missing
+            request.resource.name.matches('officialIds/' + userUid + '/.+\\.(?i)(jpe?g|png|webp|pdf)$')
+          )
+        )
+      );
+    }
+
+    // Payment Proof uploads (private): path payment_proofs/{uid}/{fileName}
+    match /payment_proofs/{userUid}/{fileName} {
+      allow read: if request.auth != null && (request.auth.uid == userUid || isStaff());
+      allow write: if request.auth != null && (
+        // Student can upload their own proof
+        (request.auth.uid == userUid && (
+          request.resource == null ||
+          (
+            request.resource != null &&
+            request.resource.size < 5 * 1024 * 1024 && // 5MB cap
+            (
+              (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+              request.resource.name.matches('payment_proofs/' + userUid + '/.+\\.(?i)(jpe?g|png|webp)$')
+            )
+          )
+        )) ||
+        // Staff can delete/update
+        isStaff()
+      );
+    }
+
+    // Student profile photo uploads (private): path profilePhotos/{uid}/photo.(jpg|png|webp)
+    match /profilePhotos/{userUid}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userUid;
+      allow write: if request.auth != null && request.auth.uid == userUid && (
+        (
+          resource == null &&
+          request.resource != null &&
+          request.resource.size < 1 * 1024 * 1024 && // 1MB
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('profilePhotos/' + userUid + '/.+\\.(?i)(jpe?g|png|webp)$')
+          )
+        )
+      );
+    }
+
+    // Add-on registration uploads (private): path addons/{uid}/{timestamp}_{id|photo}_*.(jpg|png|webp|pdf)
+    // Used by student add-on registration form (uploads official ID + optional photo).
+    match /addons/{userUid}/{fileName} {
+      allow read: if request.auth != null && (request.auth.uid == userUid || isAdmin());
+      allow write: if request.auth != null && request.auth.uid == userUid && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 6 * 1024 * 1024 && // 6MB
+          (
+            (request.resource.contentType != null && (
+              request.resource.contentType.matches('image/.+') ||
+              request.resource.contentType == 'application/pdf'
+            )) ||
+            // Fallback by extension if contentType missing
+            request.resource.name.matches('addons/' + userUid + '/.+\\.(?i)(jpe?g|png|webp|pdf)$')
+          )
+        )
+      );
+    }
+
+    // Program cover images: public read, authenticated image uploads/deletes
+    match /programs/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && (
+                     // Allow delete
+                     request.resource == null ||
+                     // Create/Update with explicit image content type and size <= 4MB
+                     (
+                       request.resource != null &&
+                       request.resource.size < 4 * 1024 * 1024 &&
+                       (
+                         (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+                         // Fallback by extension if contentType missing
+                         request.resource.name.matches('programs/.+\\.(?i)(jpe?g|png|webp)$')
+                       )
+                     )
+                   );
+    }
+
+    // Library covers and thumbnails: public read, admin-authenticated image uploads/deletes
+    match /library/{allPaths=**} {
+      allow read: if true;
+      allow write: if (isAdmin() || hasActiveDelegation('canManageLibrary')) && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 6 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('library/.+\\.(?i)(jpe?g|png|webp)$')
+          )
+        )
+      );
+    }
+
+    // Sponsorship images: public read, authenticated image uploads/deletes
+    match /sponsorships/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 6 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('sponsorships/.+\\.(?i)(jpe?g|png|webp)$')
+          )
+        )
+      );
+    }
+
+    // Writing/blog images: public read (used on public pages), admin-only image uploads/deletes
+    match /writings/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin() && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 6 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('writings/.+\\.(?i)(jpe?g|png|webp|gif)$')
+          )
+        )
+      );
+    }
+
+    // Instructor photos: public read (used on homepage), admin-only image uploads/deletes
+    match /instructors/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin() && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 4 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('instructors/.+\\.(?i)(jpe?g|png|webp|gif)$')
+          )
+        )
+      );
+    }
+
+    // Student testimonials photos: public read (used on homepage), admin-only image uploads/deletes
+    match /testimonials/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin() && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 4 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('testimonials/.+\\.(?i)(jpe?g|png|webp|gif)$')
+          )
+        )
+      );
+    }
+
+    // Institute Students photos (private): instituteStudents/{studentId}/photo_*.jpg
+    match /instituteStudents/{studentId}/{fileName} {
+      function userDoc() {
+        return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
+      }
+
+      function isAdmin() {
+        return userDoc().data.role == 'Admin' || (userDoc().data.roles is list && userDoc().data.roles.hasAny(['Admin']));
+      }
+
+      function hasActiveDelegation() {
+        return (userDoc().data.tempPermissions is map)
+          && (userDoc().data.tempPermissions.canManageInstituteStudents == true)
+          && (userDoc().data.tempPermissions.expiresAt is timestamp)
+          && (userDoc().data.tempPermissions.expiresAt > request.time);
+      }
+
+      function isFormTeacherForStudent() {
+        return ('farmTeacherGroup' in userDoc().data)
+          && (userDoc().data.farmTeacherGroup != null)
+          && (userDoc().data.farmTeacherGroup != '')
+          && ('group' in firestore.get(/databases/(default)/documents/instituteStudents/$(studentId)).data)
+          && (firestore.get(/databases/(default)/documents/instituteStudents/$(studentId)).data.group == userDoc().data.farmTeacherGroup);
+      }
+
+      function isAllowedUser() {
+        return request.auth != null && (isAdmin() || hasActiveDelegation() || isFormTeacherForStudent());
+      }
+
+      allow read: if isAllowedUser();
+
+      allow write: if isAllowedUser() && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 1 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('instituteStudents/' + studentId + '/.+\\.(?i)(jpe?g|png|webp)$')
+          )
+        )
+      );
+    }
+
+    // Volunteer photos for feedback page: public read, admin-authenticated image uploads/deletes
+    match /volunteer-photos/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin() && (
+        // Allow delete
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 4 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && request.resource.contentType.matches('image/.+')) ||
+            request.resource.name.matches('volunteer-photos/.+\\.(?i)(jpe?g|png|webp|gif)$')
+          )
+        )
+      );
+    }
+
+    // Walk-in Registration uploads: student_uploads/walkins/{fileName}
+    match /student_uploads/walkins/{fileName} {
+      allow read: if isStaff();
+      allow write: if isStaff() && (
+        request.resource == null ||
+        (
+          request.resource != null &&
+          request.resource.size < 6 * 1024 * 1024 &&
+          (
+            (request.resource.contentType != null && (
+              request.resource.contentType.matches('image/.+') ||
+              request.resource.contentType == 'application/pdf'
+            )) ||
+            request.resource.name.matches('student_uploads/walkins/.+\\.(?i)(jpe?g|png|webp|pdf)$')
+          )
+        )
+      );
+    }
+
+    // Default: deny all other paths
+  }
+}

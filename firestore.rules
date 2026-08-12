@@ -1,0 +1,2523 @@
+// ============================================================
+// FIRESTORE SECURITY RULES — IIE Educational Management Platform
+// ============================================================
+// SANITIZED FOR PORTFOLIO — All project-specific identifiers,
+// domain names, and private business data have been replaced
+// with generic placeholders.
+//
+// Scale: 2 500+ lines, 30+ reusable helper functions
+//
+// Architectural patterns demonstrated:
+//   - Multi-role RBAC (Admin, Teacher, Student, Finance, ProgramOrganizer,
+//     Volunteer, Driver, Assistant) with dual role / roles[] support
+//   - 30+ reusable predicate functions (validators, time helpers, RBAC)
+//   - Time-windowed writes: monthly submissions enforced to days 1-5 of month
+//     (IST), with 24-hour admin override stored on user profile document
+//   - Atomic payload validation for attendance records (leave-request logic,
+//     class time mutual-exclusivity)
+//   - Self-service profile editing: whitelisted fields, 30-day username
+//     change lock, reserved-word blocklist, regex format enforcement
+//   - Cross-document permission reads (assistants, form teacher scoping)
+//   - Temporary time-limited delegation flags (tempPermissions.expiresAt)
+// ============================================================
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ---------- Helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return hasRole('Admin') || hasRole('admin') || hasAnyRole(['Admin', 'admin']) || (isSignedIn() && request.auth.token.admin == true);
+    }
+
+    // Basic validators (used for public/anonymous form submissions)
+    function isShortString(v, minLen, maxLen) {
+      return (v is string) && v.size() >= minLen && v.size() <= maxLen;
+    }
+    function isPlainText(v, minLen, maxLen) {
+      // Prevent obvious stored-XSS payloads for public forms.
+      return isShortString(v, minLen, maxLen) && !v.matches('.*[<>].*');
+    }
+    function isOptionalPlainText(key, minLen, maxLen) {
+      return !(key in request.resource.data) || request.resource.data[key] == null || isPlainText(request.resource.data[key], minLen, maxLen);
+    }
+    function isEmail(v) {
+      // Firestore Rules strings do not support arbitrary escape sequences like \s.
+      // Keep this intentionally simple: no spaces, has one '@' and at least one '.' after it.
+      return (v is string) && v.size() <= 254 && v.matches('^[^ @]+@[^ @]+[.][^ @]+$');
+    }
+    function isPhoneDigits(v, minLen, maxLen) {
+      // Allow digits, spaces and common phone punctuation.
+      // Note: place '-' at end of character class to treat it literally.
+      return (v is string) && v.size() >= minLen && v.size() <= maxLen && v.matches('^[0-9+][0-9 ()+-]{5,20}$');
+    }
+    function isSafeHttpsUrl(v) {
+      return (v is string) && v.size() <= 800 && v.matches('^https://.+');
+    }
+
+    function isIsoDateYmd(v) {
+      // YYYY-MM-DD
+      return (v is string) && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isYearMonthKey(v) {
+      // YYYY-MM
+      return (v is string) && v.matches('^[0-9]{4}-[0-9]{2}$');
+    }
+
+    // Time helpers
+    // Note: request.time is UTC. Convert to IST (UTC+05:30) to match local business rules.
+    function nowIst() {
+      // Use duration.value to avoid any ambiguity in duration constructors.
+      // IST = UTC + 5h30m = 330 minutes.
+      return request.time + duration.value(330, 'm');
+    }
+    function pad2Int(n) {
+      return n < 10 ? ('0' + string(n)) : string(n);
+    }
+    function monthKeyFromTs(ts) {
+      return string(ts.year()) + '-' + pad2Int(ts.month());
+    }
+    function isWithinFirst5DaysIst() {
+      let d = nowIst().day();
+      return d >= 1 && d <= 5;
+    }
+
+    // Admin-granted override to allow late monthly submission for a specific month.
+    // Stored on the teacher's own profile doc:
+    //   monthlySubmissionOverrideMonthId == 'YYYY-MM'
+    //   monthlySubmissionOverrideGrantedAt == <server timestamp of when admin granted>
+    // The override is valid for exactly 24 hours from grantedAt.
+    function hasMonthlySubmissionOverrideFor(monthKey) {
+      let profile = userProfile().data;
+      let permMonth = profile.get('monthlySubmissionOverrideMonthId', null);
+      let grantedAt = profile.get('monthlySubmissionOverrideGrantedAt', null);
+      return userProfileExists()
+        && permMonth == monthKey
+        && grantedAt != null
+        && (request.time - grantedAt) < duration.value(24, 'h');
+    }
+
+    // Monthly submissions validators
+    function isPercentIntOrNull(v) {
+      // JS SDK values may be encoded as doubles; accept int OR float.
+      return v == null || ((v is int || v is float) && v >= 0 && v <= 100);
+    }
+
+    function isMonthlyGoalsMap(m) {
+      return (m is map)
+        && m.keys().hasOnly(['quran','hadith','aqeedah','fiqah','arabic','seerat','dua','nazirah','gk'])
+        && isPlainText(m.quran, 0, 800)
+        && isPlainText(m.hadith, 0, 800)
+        && isPlainText(m.aqeedah, 0, 800)
+        && isPlainText(m.fiqah, 0, 800)
+        && isPlainText(m.arabic, 0, 800)
+        && isPlainText(m.seerat, 0, 800)
+        && isPlainText(m.dua, 0, 800)
+        && isPlainText(m.nazirah, 0, 800)
+        && isPlainText(m.gk, 0, 800);
+    }
+
+    function isMonthlyReportItem(r) {
+      return (r is map)
+        && r.keys().hasOnly(['report','completion','remarks'])
+        && isPlainText(r.report, 0, 1200)
+        && isPercentIntOrNull(r.completion)
+        && isPlainText(r.remarks, 0, 800);
+    }
+
+    function isMonthlyReportMap(m) {
+      return (m is map)
+        && m.keys().hasOnly(['quran','hadith','aqeedah','fiqah','arabic','seerat','dua','nazirah','gk'])
+        && isMonthlyReportItem(m.quran)
+        && isMonthlyReportItem(m.hadith)
+        && isMonthlyReportItem(m.aqeedah)
+        && isMonthlyReportItem(m.fiqah)
+        && isMonthlyReportItem(m.arabic)
+        && isMonthlyReportItem(m.seerat)
+        && isMonthlyReportItem(m.dua)
+        && isMonthlyReportItem(m.nazirah)
+        && isMonthlyReportItem(m.gk);
+    }
+
+    function isMonthlySummaryMap(m) {
+      return (m is map)
+        && m.keys().hasOnly(['overallAchievement','areasOfImprovement','suggestions'])
+        && isPercentIntOrNull(m.overallAchievement)
+        && isPlainText(m.areasOfImprovement, 0, 1200)
+        && isPlainText(m.suggestions, 0, 1200);
+    }
+
+    function isMonthlySubmissionCreate(userId, monthId) {
+      // Hotfix: Relaxed strict payload checking to unblock submission failures
+      return request.resource.data.keys().hasAll(['teacherUid', 'monthId', 'createdAt', 'updatedAt'])
+        && request.resource.data.teacherUid == userId
+        && request.resource.data.teacherUid == request.auth.uid
+        && request.resource.data.monthId == monthId;
+    }
+
+    function isTimeHm(v) {
+      // 24-hour HH:MM
+      return (v is string) && v.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+
+    function isNumber(v) {
+      return (v is int) || (v is float);
+    }
+
+    function isOptionalTimeHm(key) {
+      return !(key in request.resource.data) || request.resource.data[key] == null || isTimeHm(request.resource.data[key]);
+    }
+
+    function isOptionalLongText(key, maxLen) {
+      // Allows the field to be absent, null, or a plain string up to maxLen characters.
+      return !(key in request.resource.data)
+        || request.resource.data[key] == null
+        || isPlainText(request.resource.data[key], 0, maxLen);
+    }
+
+    function isTeacherAttendancePayloadCommon(docId) {
+      return request.resource.data.keys().hasOnly([
+        'teacherUid',
+        'teacherIdLC',
+        'date',
+        'present',
+        'classFrom',
+        'classTo',
+        'leaveRequest',
+        'leaveStatus',
+        'leaveReason',
+        'topicsTaught',
+        'createdAt',
+        'updatedAt'
+      ])
+      && (request.resource.data.teacherUid is string)
+      && isIsoDateYmd(request.resource.data.date)
+      && (docId == (request.resource.data.teacherUid + '_' + request.resource.data.date))
+      && (request.resource.data.present is bool)
+      && ( !("teacherIdLC" in request.resource.data) || request.resource.data.teacherIdLC == null || request.resource.data.teacherIdLC is string )
+      && ( !('leaveRequest' in request.resource.data) || request.resource.data.leaveRequest == null || request.resource.data.leaveRequest is bool )
+      && ( !('leaveStatus' in request.resource.data) || request.resource.data.leaveStatus == null || request.resource.data.leaveStatus in ['pending','approved','rejected'] )
+      && isOptionalLongText('topicsTaught', 2000)
+      && isOptionalPlainText('leaveReason', 0, 200)
+      && isOptionalTimeHm('classFrom')
+      && isOptionalTimeHm('classTo')
+      && (request.resource.data.updatedAt is timestamp)
+      && (request.resource.data.updatedAt == request.time)
+      && (
+        // If leave is requested, attendance must not include class times and cannot be present
+        (('leaveRequest' in request.resource.data) && request.resource.data.leaveRequest == true)
+          ? (
+              request.resource.data.present == false
+              && (!('classFrom' in request.resource.data) || request.resource.data.classFrom == null)
+              && (!('classTo' in request.resource.data) || request.resource.data.classTo == null)
+              && (('leaveStatus' in request.resource.data) && request.resource.data.leaveStatus != null)
+            )
+          : (
+              // If no leave request, leave fields must be absent or null
+              (!('leaveStatus' in request.resource.data) || request.resource.data.leaveStatus == null)
+              && (!('leaveReason' in request.resource.data) || request.resource.data.leaveReason == null)
+            )
+      )
+      && (
+        request.resource.data.present == false
+        ? (
+            (!("classFrom" in request.resource.data) || request.resource.data.classFrom == null)
+            && (!("classTo" in request.resource.data) || request.resource.data.classTo == null)
+          )
+        : true
+      );
+    }
+
+    function isTeacherLeaveStatusSafeForNonAdmin() {
+      // Teachers may only create/update leave requests as 'pending' (or clear it).
+      return (!('leaveRequest' in request.resource.data) || request.resource.data.leaveRequest != true)
+        ? ( !('leaveStatus' in request.resource.data) || request.resource.data.leaveStatus == null )
+        : ( request.resource.data.leaveStatus == 'pending' );
+    }
+
+    function isTeacherAttendanceCreate(docId) {
+      return isTeacherAttendancePayloadCommon(docId)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == request.time);
+    }
+
+    function isTeacherAttendanceUpdate(docId) {
+      return isTeacherAttendancePayloadCommon(docId)
+        // createdAt must already exist and must not change
+        && (resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == resource.data.createdAt)
+        // immutable identifiers
+        && (request.resource.data.teacherUid == resource.data.teacherUid)
+        && (request.resource.data.date == resource.data.date);
+    }
+
+    function isFormTeacherAttendancePayloadCommon(docId) {
+      return request.resource.data.keys().hasOnly([
+        'teacherUid',
+        'group',
+        'date',
+        'presentCount',
+        'absentCount',
+        'feeReceived',
+        'feeAmount',
+        'createdAt',
+        'updatedAt'
+      ])
+      && (request.resource.data.teacherUid is string)
+      && isIsoDateYmd(request.resource.data.date)
+      && (docId == (request.resource.data.teacherUid + '_' + request.resource.data.date))
+      && isPlainText(request.resource.data.group, 1, 80)
+      && (request.resource.data.presentCount is int) && (request.resource.data.presentCount >= 0) && (request.resource.data.presentCount <= 5000)
+      && (request.resource.data.absentCount is int) && (request.resource.data.absentCount >= 0) && (request.resource.data.absentCount <= 5000)
+      && (request.resource.data.feeReceived is bool)
+      && (
+        request.resource.data.feeReceived == true
+          ? ( !('feeAmount' in request.resource.data) || request.resource.data.feeAmount == null || (isNumber(request.resource.data.feeAmount) && request.resource.data.feeAmount >= 0 && request.resource.data.feeAmount <= 10000000) )
+          : ( !('feeAmount' in request.resource.data) || request.resource.data.feeAmount == null )
+      )
+      && (request.resource.data.updatedAt is timestamp)
+      && (request.resource.data.updatedAt == request.time);
+    }
+
+    function isFormTeacherAttendanceCreate(docId) {
+      return isFormTeacherAttendancePayloadCommon(docId)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == request.time);
+    }
+
+    function isFormTeacherAttendanceUpdate(docId) {
+      return isFormTeacherAttendancePayloadCommon(docId)
+        && (resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == resource.data.createdAt)
+        && (request.resource.data.teacherUid == resource.data.teacherUid)
+        && (request.resource.data.date == resource.data.date);
+    }
+
+    function isAppointmentRequestCreate() {
+      // Public form submission. Keep strict to prevent spam payloads.
+      return request.resource.data.keys().hasOnly([
+        'instructorId',
+        'instructorName',
+        'name',
+        'parentage',
+        'address',
+        'email',
+        'phone',
+        'requestedDate',
+        'requestedTime',
+        'status',
+        'createdAt'
+      ])
+      && isShortString(request.resource.data.instructorId, 1, 200)
+      && isPlainText(request.resource.data.instructorName, 2, 120)
+      && isPlainText(request.resource.data.name, 2, 80)
+      && isPlainText(request.resource.data.parentage, 2, 120)
+      && isPlainText(request.resource.data.address, 4, 220)
+      && isEmail(request.resource.data.email)
+      && isPhoneDigits(request.resource.data.phone, 6, 25)
+      && isIsoDateYmd(request.resource.data.requestedDate)
+      && isTimeHm(request.resource.data.requestedTime)
+      && request.resource.data.status == 'new'
+      && (request.resource.data.createdAt is timestamp);
+    }
+    function userProfile() {
+      // Returns the user profile document snapshot (may be non-existent)
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function userProfileExists() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function hasRole(role) {
+      // Safe: only access .data if profile exists
+      return userProfileExists() && (
+        userProfile().data.get('role', '') == role ||
+        (userProfile().data.get('roles', []) is list && userProfile().data.get('roles', []).hasAny([role]))
+      );
+    }
+    function hasAnyRole(roles) {
+      // Checks primary role or roles array safely
+      return userProfileExists() && (
+        userProfile().data.get('role', '') in roles ||
+        (userProfile().data.get('roles', []) is list && userProfile().data.get('roles', []).hasAny(roles))
+      );
+    }
+    // Username helpers
+    function isValidUsernameId(u) {
+      return u.matches('^[a-z0-9._-]{3,20}$');
+    }
+    function isReservedUsername(u) {
+      return u in [
+        'admin','root','system','support','about','contact','home','index','login','logout','signup','register','profile',
+        'teacher','instructor','finance','volunteer','events','exams','notices','tasks','settings','privacy','terms',
+        'api','static','assets','storage','firestore','iie','[YOUR_PROJECT_ID]','mail','email','help','www'
+      ];
+    }
+    function usernameChangeLockExpired(ts) {
+      return ts == null || request.time - ts > duration.value(30, 'd');
+    }
+    // Check if current user is an assigned assistant for a given teacher
+    function isAssistantFor(teacherUid) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/assistants/$(teacherUid)) &&
+        (request.auth.uid in get(/databases/$(database)/documents/assistants/$(teacherUid)).data.assistantUids);
+    }
+    function hasActiveDelegation(flag) {
+      // Some older admin tools wrote permission flags as strings like "true".
+      // Accept boolean true primarily, but also tolerate "true" / 1 to avoid locking out valid staff.
+      return userProfileExists()
+        && userProfile().data.tempPermissions != null
+        && userProfile().data.tempPermissions is map
+        && (
+          userProfile().data.tempPermissions.get(flag, false) == true
+          || userProfile().data.tempPermissions.get(flag, false) == 'true'
+          || userProfile().data.tempPermissions.get(flag, false) == 1
+        )
+        && userProfile().data.tempPermissions.get('expiresAt', null) != null
+        && request.time < userProfile().data.tempPermissions.expiresAt;
+    }
+    // Check if current user (assistant) has a specific permission granted by a given teacher
+    // Permissions live at: /assistants/{teacherUid}/perms/{assistantUid} with boolean fields
+    function assistantHasPermFor(teacherUid, permKey) {
+      return isSignedIn()
+        && isAssistantFor(teacherUid)
+        && exists(/databases/$(database)/documents/assistants/$(teacherUid)/perms/$(request.auth.uid))
+        && get(/databases/$(database)/documents/assistants/$(teacherUid)/perms/$(request.auth.uid)).data[permKey] == true;
+    }
+
+    // Check if the current teacher has a valid (non-expired) attendance date override
+    // for a specific date. Reads from /users/{uid}.attendanceOverrideDate + grantedAt + durationMs.
+    function hasAttendanceOverride(dateStr) {
+      let p = userProfile().data;
+      let overrideDate = p.get('attendanceOverrideDate', null);
+      let grantedAt   = p.get('attendanceOverrideGrantedAt', null);
+      let durationMs  = p.get('attendanceOverrideDurationMs', 86400000); // default 24 hrs
+      return userProfileExists()
+        && overrideDate != null
+        && overrideDate == dateStr
+        && grantedAt != null
+        && (request.time.toMillis() - grantedAt.toMillis()) < durationMs;
+    }
+
+    // ---------- Admin Broadcasts ----------
+    match /admin_broadcasts/{docId} {
+      allow read: if isSignedIn() && (hasRole('Admin') || resource == null || resource.data.targetUid == 'all' || resource.data.targetUid == request.auth.uid);
+      allow delete: if hasRole('Admin');
+      allow create, update: if false; // Created via Cloud Functions
+    }
+
+    // ---------- Website Settings (public read, admin/organizer write) ----------
+    match /settings/{document} {
+      allow read: if true;
+      // Admin: full write. ProgramOrganizer: allowed to write the global settings doc
+      // (needed to toggle auto-approve and similar operational settings).
+      allow write: if hasRole('Admin') || isProgramOrganizerRole();
+    }
+
+    // ---------- Instructors (public read visible, admin write) ----------
+    match /instructors/{instructorId} {
+      // Public may read instructor profiles for the homepage.
+      // Visibility is handled client-side to avoid query/index constraints.
+      allow read: if true;
+      allow create, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Appointment Requests (public create, admin read/manage) ----------
+    match /appointment_requests/{reqId} {
+      allow create: if isAppointmentRequestCreate();
+      allow read, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Student Testimonials (public read, admin write) ----------
+    match /student_testimonials/{testimonialId} {
+      allow read: if true;
+      allow create, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Users ----------
+  match /users/{userId} {
+      // Read: self, Admin, or any signed-in user if the target profile is a Volunteer (for leaderboards/assignment lists)
+      allow read: if (
+        (isSignedIn() && request.auth.uid == userId) ||
+        hasRole('Admin') ||
+        hasActiveDelegation('canManageLibrary') ||
+        // Finance roles (Manager/Assistant) may read profiles of other Finance roles to build team lists
+        (
+          hasAnyRole(['Manager','Assistant']) && (
+            // Target has exact role as Manager/Assistant or their finance variants
+            resource.data.role == 'Manager' ||
+            resource.data.role == 'Assistant' ||
+            resource.data.role == 'Finance Manager' ||
+            resource.data.role == 'Finance Assistant' ||
+            // Or roles array contains any of these
+            (resource.data.roles != null && (
+              'Manager' in resource.data.roles ||
+              'Assistant' in resource.data.roles ||
+              'Finance Manager' in resource.data.roles ||
+              'Finance Assistant' in resource.data.roles
+            ))
+          )
+        ) ||
+        // Program Organizers (including assistants) may view Student profiles (for organizing programs)
+        (isProgramOrganizerRole() && (resource.data.role == 'Student' || (resource.data.roles != null && ('Student' in resource.data.roles)))) ||
+        // Program Organizer Assistants may view primary Program Organizer profiles
+        (isProgramOrganizerRole() && resource.data.role == 'ProgramOrganizer') ||
+        (isSignedIn() && resource.data.role == 'Volunteer') ||
+        // Assistants may view the profiles of teachers they are assigned to
+        isAssistantFor(userId) ||
+        // Teachers may view the profiles of assistants assigned under them
+        (
+          hasRole('Teacher') &&
+          exists(/databases/$(database)/documents/assistants/$(request.auth.uid)) &&
+          (userId in get(/databases/$(database)/documents/assistants/$(request.auth.uid)).data.assistantUids)
+        )
+      );
+      // Admin retains full control
+      allow create, delete: if hasRole('Admin');
+      // Allow a signed-in user to update specific self-profile fields only
+      allow update: if hasRole('Admin') || (
+        isSignedIn() && request.auth.uid == userId &&
+        // Only allow changing these specific fields (plus username fields under constraints)
+        request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          'fullName',
+          'parentage',
+          'phone',
+          'gender',
+          'address',
+          'pin',
+          'altPhone',
+          'skills',
+          'availability',
+          'username',
+          'usernameLC',
+          'lastUsernameChange'
+        ]) &&
+        (
+          // If username isn't changing, fine; else enforce extra constraints
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['username','usernameLC'])
+          || (
+            request.resource.data.diff(resource.data).changedKeys().hasAny(['lastUsernameChange'])
+            && (
+              // If this is the first claim (no current username), allow regardless of lock
+              resource.data.usernameLC == null
+              || usernameChangeLockExpired(resource.data.lastUsernameChange)
+            )
+            && isValidUsernameId(request.resource.data.usernameLC)
+            && !isReservedUsername(request.resource.data.usernameLC)
+          )
+        ) &&
+        // Basic validation for common self-editable fields (validate only when those fields change)
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['fullName'])
+          || isPlainText(request.resource.data.fullName, 1, 100)
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['parentage'])
+          || request.resource.data.parentage == null
+          || isPlainText(request.resource.data.parentage, 0, 80)
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['address'])
+          || request.resource.data.address == null
+          || isPlainText(request.resource.data.address, 0, 200)
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['pin'])
+          || request.resource.data.pin == null
+          || isPlainText(request.resource.data.pin, 0, 20)
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['gender'])
+          || request.resource.data.gender == null
+          || request.resource.data.gender in ['','Male','Female']
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['phone'])
+          || request.resource.data.phone == null
+          || request.resource.data.phone == ''
+          || isPhoneDigits(request.resource.data.phone, 6, 20)
+        ) &&
+        (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['altPhone'])
+          || request.resource.data.altPhone == null
+          || request.resource.data.altPhone == ''
+          || isPhoneDigits(request.resource.data.altPhone, 6, 20)
+        ) &&
+        // Prevent changing email via this path: ensure 'email' is not among changed keys
+        !request.resource.data.diff(resource.data).changedKeys().hasAny(['email'])
+      ) || (
+        // Program Organizer can delegate organizerPermissions to Volunteers
+        isSignedIn() &&
+        (hasRole('ProgramOrganizer') || (userProfile().data.roles != null && ('ProgramOrganizer' in userProfile().data.roles))) &&
+        resource.data.role == 'Volunteer' &&
+        request.resource.data.diff(resource.data).changedKeys().hasOnly(['organizerPermissions'])
+      );
+    }
+
+    // ---------- Teacher attendance ----------
+    // Collection: /teacher_attendance/{teacherUid}_{YYYY-MM-DD}
+    // Fields: teacherUid, teacherIdLC?, date, present, classFrom?, classTo?, createdAt, updatedAt
+    match /teacher_attendance/{docId} {
+      // Allow teachers to `get` their own doc even if it doesn't exist yet.
+      // Otherwise Firestore returns PERMISSION_DENIED for missing docs.
+      function isOwnTeacherAttendanceId(docId) {
+        return isSignedIn() && (docId.matches('^' + request.auth.uid + '_[0-9]{4}-[0-9]{2}-[0-9]{2}$'));
+      }
+
+      allow get: if hasAnyRole(['Admin']) || isOwnTeacherAttendanceId(docId) || (isSignedIn() && resource.data.teacherUid == request.auth.uid);
+      allow list: if hasAnyRole(['Admin']);
+      allow create: if (hasAnyRole(['Admin']) && isTeacherAttendanceCreate(docId)) || (
+        isSignedIn()
+        && request.resource.data.teacherUid == request.auth.uid
+        && isTeacherAttendanceCreate(docId)
+        && isTeacherLeaveStatusSafeForNonAdmin()
+      );
+      // Write-once: teachers cannot edit attendance after creation.
+      // Admins may update (e.g., approve/reject leave requests).
+      // Exception: teacher may update their own record when admin granted an attendance override.
+      allow update: if (hasAnyRole(['Admin']) && isTeacherAttendanceUpdate(docId)) || (
+        isSignedIn()
+        && hasAnyRole(['Teacher'])
+        && resource.data.teacherUid == request.auth.uid
+        && isTeacherAttendanceUpdate(docId)
+        && isTeacherLeaveStatusSafeForNonAdmin()
+        && hasAttendanceOverride(resource.data.date)
+      );
+      allow delete: if hasAnyRole(['Admin']);
+    }
+
+    // ---------- Form teacher group attendance (daily summary) ----------
+    // Collection: /form_teacher_attendance/{teacherUid}_{YYYY-MM-DD}
+    // Fields: teacherUid, group, date, presentCount, absentCount, feeReceived, feeAmount?, createdAt, updatedAt
+    match /form_teacher_attendance/{docId} {
+      allow read: if hasAnyRole(['Admin']) || (isSignedIn() && resource.data.teacherUid == request.auth.uid);
+
+      // Create: only the assigned form teacher for that group (write-once behavior enforced by denying teacher updates)
+      allow create: if (
+        isSignedIn()
+        && hasAnyRole(['Teacher'])
+        && request.resource.data.teacherUid == request.auth.uid
+        && isFormTeacherAttendanceCreate(docId)
+        && userProfileExists()
+        && (userProfile().data.farmTeacherGroup == request.resource.data.group)
+      );
+
+      // Update/Delete: Admin only (teachers cannot edit after save)
+      allow update: if hasAnyRole(['Admin']) && isFormTeacherAttendanceUpdate(docId);
+      allow delete: if hasAnyRole(['Admin']);
+    }
+
+    // ---------- Weekly Group Reports ----------
+    // Collection: /weeklyGroupReports/{docId}
+    match /weeklyGroupReports/{docId} {
+      allow read: if hasAnyRole(['Admin']) || (isSignedIn() && resource.data.teacherUid == request.auth.uid);
+      allow create: if isSignedIn() 
+        && hasAnyRole(['Teacher', 'Admin']) 
+        && request.resource.data.teacherUid == request.auth.uid;
+      allow update, delete: if hasAnyRole(['Admin']);
+    }
+
+    // ---------- Usernames reservation map ----------
+    // Path: /usernames/{usernameLC}
+    // Document shape: { ownerUid: string, usernameOriginal: string, createdAt: timestamp }
+    match /usernames/{uname} {
+      // Public can read to check availability
+      allow read: if true;
+      // Create a reservation if:
+      // - Signed in and claiming for self
+      // - ID is valid and not reserved
+      // - Doc does not already exist (strict create)
+      // - Payload has required fields and types
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && isValidUsernameId(uname) && !isReservedUsername(uname)
+        && !exists(/databases/$(database)/documents/usernames/$(uname))
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && (request.resource.data.usernameOriginal is string);
+      // Only the owner (or Admin) can delete their reservation, and only after lock expiry.
+      // If the doc doesn't exist, allow delete as a no-op for signed-in users to keep batch operations simple.
+      allow delete: if hasRole('Admin') || (
+        isSignedIn() && (
+          !exists(/databases/$(database)/documents/usernames/$(uname))
+          || (
+            resource.data.ownerUid == request.auth.uid
+            && usernameChangeLockExpired(get(/databases/$(database)/documents/users/$(request.auth.uid)).data.lastUsernameChange)
+          )
+        )
+      );
+      // No updates to reservation docs (immutable aside from delete)
+      allow update: if false;
+    }
+
+    // ---------- Student IDs reservation map (replacing usernames) ----------
+    // Path: /studentIds/{usernameLC}
+    // Document shape: { ownerUid: string, usernameOriginal: string, role: 'Student', createdAt: timestamp }
+    match /studentIds/{uname} {
+      // Public read: allows availability checks and resolving usernames to email via backend
+      allow read: if true;
+      // No client-side writes; only backend functions write/delete these docs
+      allow create, update, delete: if false;
+    }
+
+    // ---------- Monthly submissions (per-teacher subcollection) ----------
+    // Path: /users/{teacherUid}/monthlySubmissions/{YYYY-MM}
+    // Teachers can create within first 5 days of the current month (IST),
+    // or when admin grants a 24-hour override (monthlySubmissionOverrideMonthId + grantedAt).
+    // Within those same windows, teachers may also update (edit) their submission.
+    match /users/{userId}/monthlySubmissions/{monthId} {
+      // Read: owner or Admin. Keep independent of resource to allow `get` when missing.
+      allow get: if (isSignedIn() && request.auth.uid == userId) || hasAnyRole(['Admin']);
+      allow list: if (isSignedIn() && request.auth.uid == userId) || hasAnyRole(['Admin']);
+
+      // Create: teacher within the edit window (days 1-5 or 24-hr admin override for this month).
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && isMonthlySubmissionCreate(userId, monthId)
+        && (isWithinFirst5DaysIst() || hasMonthlySubmissionOverrideFor(monthId));
+
+      // Update: allowed in the same window as create.
+      // createdAt must not change (preserved from original); updatedAt must be server time.
+      allow update: if hasAnyRole(['Admin']) || (
+        isSignedIn()
+        && request.auth.uid == userId
+        && hasAnyRole(['Teacher'])
+        && (isWithinFirst5DaysIst() || hasMonthlySubmissionOverrideFor(monthId))
+        && isMonthlySubmissionCreate(userId, monthId)
+        // createdAt must be preserved from the existing document
+        && request.resource.data.createdAt == resource.data.createdAt
+      );
+
+      // Admin-only delete (optional cleanup)
+      allow delete: if hasAnyRole(['Admin']);
+    }
+
+    // ---------- Notifications (per-user subcollection) ----------
+    match /users/{userId}/notifications/{notifId} {
+      function isAdminExpanded() {
+        return isSignedIn() && (
+          userProfile().data.role == 'Admin' ||
+          (userProfile().data.roles != null && ('Admin' in userProfile().data.roles))
+        );
+      }
+      function isOrganizerAssistantOf(targetId) {
+        return isProgramOrganizerRole() && get(/databases/$(database)/documents/users/$(targetId)).data.role == 'ProgramOrganizer';
+      }
+      // Read: owner, admin, or if target is ProgramOrganizer and caller is their assistant
+      allow read: if (isSignedIn() && request.auth.uid == userId) || isAdminExpanded() || isOrganizerAssistantOf(userId);
+      allow create: if (isSignedIn() && request.auth.uid == userId) || isAdminExpanded() || isOrganizerAssistantOf(userId);
+      // Updates:
+      // - Owner: any field (within client patterns)
+      // - Admin or Assistant: limited to replies/sentMessageId/status for safety
+      allow update: if (
+        isSignedIn() && request.auth.uid == userId
+      ) || (
+        (isAdminExpanded() || isOrganizerAssistantOf(userId)) && request.resource.data.diff(resource.data).changedKeys().hasOnly(['replies','sentMessageId','status'])
+      );
+      allow delete: if (isSignedIn() && request.auth.uid == userId) || isAdminExpanded() || isOrganizerAssistantOf(userId);
+    }
+
+    // ---------- Public site content ----------
+    match /notices/{docId} {
+      allow read: if true;
+      // Finance roles have no write here; only Admin or explicit delegation may write
+      allow write: if hasRole('Admin') || hasActiveDelegation('canManageNotices');
+    }
+
+    // ---------- Organizer Broadcast Announcements ----------
+    // Collection: /announcements/{announcementId}
+    // Written by ProgramOrganizer; readable by all signed-in students.
+    match /announcements/{announcementId} {
+      // Any authenticated user (students, organizers, admin) can read
+      allow read: if isSignedIn();
+      // Only ProgramOrganizers (and Admins) can create
+      allow create: if isSignedIn() && (hasRole('Admin') || hasRole('ProgramOrganizer') || hasAnyRole(['Admin','ProgramOrganizer']));
+      // Only Admins and ProgramOrganizers can delete
+      allow delete: if hasRole('Admin') || hasRole('ProgramOrganizer') || hasAnyRole(['Admin','ProgramOrganizer']);
+      // No client-side updates (edit via delete + re-create)
+      allow update: if hasRole('Admin');
+    }
+
+    // ---------- Student Payment Proofs ----------
+    // Collection: /payment_proofs/{proofId}
+    // Created by student (own proof only); reviewed by Finance/Organizer/Admin.
+    match /payment_proofs/{proofId} {
+      // Student can create their own proof
+      allow create: if isSignedIn() && request.resource.data.studentUid == request.auth.uid;
+      // Student can read their own; organizers/admin can read all
+      allow read: if isSignedIn() && (
+        resource.data.studentUid == request.auth.uid ||
+        hasRole('Admin') || hasRole('ProgramOrganizer') || hasRole('Finance')
+      );
+      // Only organizers/admin/finance can update status (verify/reject)
+      allow update: if hasRole('Admin') || hasRole('ProgramOrganizer') || hasRole('Finance');
+      // No deletes from client (except via our specific rule below, but keeping it strict here and adding Admin only first, then allowing the organizer if they're the ones maintaining it)
+      // Actually we just added a deleteProof function to fee-management which can be used by Organizer. Let's allow Organizer to delete too.
+      allow delete: if hasRole('Admin') || hasRole('ProgramOrganizer') || hasRole('Finance');
+    }
+
+    // ---------- Manual Fee Payments Log ----------
+    // Collection: /fee_payments/{paymentId}
+    // Maintained by Admin/Finance via the fee-management dashboard.
+    match /fee_payments/{paymentId} {
+      allow read, write: if hasRole('Admin') || hasRole('Finance') || hasRole('ProgramOrganizer');
+    }
+
+    // ---------- Featured writings (public site) ----------
+    // Collection: /writings/{docId}
+    // Recommended document fields:
+    // - status: 'draft' | 'published'
+    // - publishedAt: timestamp
+    // - title, content/body, writerName, writerRole, reviewerName, excerpt
+    match /writings/{docId} {
+      allow read: if hasRole('Admin') || (hasRole('Admin') || hasRole('ProgramOrganizer') || (isProgramOrganizerRole() && hasOrganizerPermission('canReviewBlogs'))) || (
+        resource.data.status == 'published'
+        || resource.data.status == 'Published'
+        || resource.data.published == true
+        || resource.data.isPublished == true
+      ) || (isSignedIn() && resource.data.authorUid == request.auth.uid);
+      
+      allow create: if hasRole('Admin') || (hasRole('Admin') || hasRole('ProgramOrganizer') || (isProgramOrganizerRole() && hasOrganizerPermission('canReviewBlogs'))) || (
+        isSignedIn() && exists(/databases/$(database)/documents/students/$(request.auth.uid))
+        && request.resource.data.status == 'pending_review'
+        && request.resource.data.authorUid == request.auth.uid
+      );
+      
+      allow update: if hasRole('Admin') || (hasRole('Admin') || hasRole('ProgramOrganizer') || (isProgramOrganizerRole() && hasOrganizerPermission('canReviewBlogs'))) || (
+        isSignedIn() && exists(/databases/$(database)/documents/students/$(request.auth.uid))
+        && resource.data.authorUid == request.auth.uid
+        && resource.data.status == 'pending_review'
+        && request.resource.data.status == 'pending_review'
+      ) || (
+        isSignedIn() 
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['likes'])
+      );
+      
+      allow delete: if hasRole('Admin') || (hasRole('Admin') || hasRole('ProgramOrganizer') || (isProgramOrganizerRole() && hasOrganizerPermission('canReviewBlogs'))) || (
+        isSignedIn() && exists(/databases/$(database)/documents/students/$(request.auth.uid))
+        && resource.data.authorUid == request.auth.uid
+        && resource.data.status == 'pending_review'
+      );
+    }
+
+    match /writings/{docId}/comments/{commentId} {
+      allow read: if true;
+      allow create: if isSignedIn() 
+        && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.likesCount == 0
+        && request.resource.data.dislikesCount == 0;
+      
+      // Author can edit their comment but cannot change likes/dislikes counts
+      allow update: if isSignedIn() 
+        && resource.data.authorUid == request.auth.uid
+        && !request.resource.data.diff(resource.data).changedKeys().hasAny(['likesCount', 'dislikesCount', 'authorUid']);
+      
+      // Admin/Organizers can do anything
+      allow update, delete: if hasRole('Admin') || isProgramOrganizerRole();
+      
+      // Allow any signed-in user to increment/decrement likes by exactly 1
+      allow update: if isSignedIn() 
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['likesCount', 'dislikesCount'])
+        && (request.resource.data.likesCount == resource.data.likesCount + 1 || request.resource.data.likesCount == resource.data.likesCount - 1 || request.resource.data.likesCount == resource.data.likesCount)
+        && (request.resource.data.dislikesCount == resource.data.dislikesCount + 1 || request.resource.data.dislikesCount == resource.data.dislikesCount - 1 || request.resource.data.dislikesCount == resource.data.dislikesCount);
+      
+      allow delete: if isSignedIn() && resource.data.authorUid == request.auth.uid;
+    }
+
+    match /writings/{docId}/interactions/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    match /writings/{docId}/likes/{userId} {
+      allow read: if true;
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow update, delete: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Writings revision history (subcollection)
+    // Path: /writings/{docId}/revisions/{revId}
+    // Admin-only: these can contain draft content.
+    match /writings/{docId}/revisions/{revId} {
+      allow read, create, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Public writing engagement (views/reads) ----------
+    // Collection: /writing_engagement/{writingId}/events/{eventId}
+    // Public can create create-only events to track engagement; Admin can read.
+    // Document shape:
+    // { writingId: string, sessionId: string, type: 'view'|'read', createdAt: timestamp }
+    match /writing_engagement/{writingId}/events/{eventId} {
+      function isValidSessionId(s) {
+        return s is string && s.size() >= 8 && s.size() <= 80 && s.matches('^[A-Za-z0-9._:-]+$');
+      }
+      function isValidType(t) {
+        return t in ['view', 'read'];
+      }
+      // Only Admin can read engagement logs.
+      allow read: if hasRole('Admin');
+      // Public create-only with strict validation (no updates/deletes).
+      allow create: if
+        request.resource.data.keys().hasOnly(['writingId','sessionId','type','createdAt'])
+        && request.resource.data.writingId == writingId
+        && isValidSessionId(request.resource.data.sessionId)
+        && isValidType(request.resource.data.type)
+        && eventId == (request.resource.data.type + '_' + request.resource.data.sessionId)
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /events/{docId} {
+      allow read: if true;
+      // Finance roles have no write here; only Admin, ProgramOrganizer, or explicit delegation may write
+      allow write: if hasRole('Admin') || hasRole('ProgramOrganizer') || hasActiveDelegation('canManageEvents');
+    }
+    // Exams: public can read only published exams; Admin and owners manage; assistants per delegated perms
+    match /exams/{examId} {
+      // Read rules:
+      // - Anyone may read published exams (public catalog)
+      // - Admin can read all
+      // - The exam owner can read
+      // - Assistants with delegated perms for the owner can read
+      allow read: if (resource.data.published == true)
+        || hasRole('Admin')
+        || (isSignedIn() && resource.data.ownerUid == request.auth.uid)
+        || assistantHasPermFor(resource.data.ownerUid, 'manageExams')
+        || assistantHasPermFor(resource.data.ownerUid, 'viewAttempts')
+        || assistantHasPermFor(resource.data.ownerUid, 'viewSubmissions');
+      // Create: Admin or a Teacher creating their own exam, or an assistant with manageExams for that owner
+      allow create: if hasRole('Admin') || hasRole('Teacher') || (
+        isSignedIn()
+        && request.resource.data.ownerUid != null
+        && assistantHasPermFor(request.resource.data.ownerUid, 'manageExams')
+      );
+      // Update/Delete: Admin, the owner, or an assistant with manageExams for the owner
+      allow update, delete: if hasRole('Admin')
+        || (isSignedIn() && resource.data.ownerUid == request.auth.uid)
+        || assistantHasPermFor(resource.data.ownerUid, 'manageExams');
+    }
+
+    // Public submission of exam pre-start details; readable by Admin or Teachers
+    match /exam_attempts_meta/{docId} {
+      // Public create allowed, but validate shape and require referenced exam to exist.
+      allow create: if (
+        request.resource.data.keys().hasOnly(['examId','details','createdAt','createdAtMs','createdAtISO','ua','lang'])
+        && (request.resource.data.examId is string)
+        && exists(/databases/$(database)/documents/exams/$(request.resource.data.examId))
+        && (get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.published == true)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAtMs is int || request.resource.data.createdAtMs is number)
+        && isShortString(request.resource.data.createdAtISO, 10, 40)
+        && isShortString(request.resource.data.ua, 0, 400)
+        && isShortString(request.resource.data.lang, 0, 40)
+        && (request.resource.data.details is map)
+      );
+      // Read: Admin, or the owner teacher of the related exam, or an assistant with appropriate perms
+      allow read: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null && (
+          get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'viewAttempts') ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams')
+        )
+      );
+      // Only Admin can update; Delete allowed for Admin or the Teacher who owns the related exam
+      allow update: if hasRole('Admin');
+      // Delete: Admin, the owning Teacher, or an assistant with manageExams (or viewAttempts elevated) for the owner
+      allow delete: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null && (
+          get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams') ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'viewAttempts')
+        )
+      );
+    }
+    // Full exam submissions with answers and score snapshot
+    match /exam_submissions/{docId} {
+      // Public create allowed, but validate payload and require referenced exam to exist.
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'examId','examTitle','ownerUid','answers','questions','mcqCorrect','mcqTotal','percent',
+          'startedAtMs','submittedAt','submittedAtMs','submittedAtISO','autoSubmitted',
+          'attemptMetaId','details','ua','lang'
+        ])
+        && (request.resource.data.examId is string)
+        && exists(/databases/$(database)/documents/exams/$(request.resource.data.examId))
+        && (get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.published == true)
+        && (request.resource.data.submittedAt is timestamp)
+        && (request.resource.data.submittedAtMs is int || request.resource.data.submittedAtMs is number)
+        && isShortString(request.resource.data.submittedAtISO, 10, 40)
+        && (request.resource.data.startedAtMs is int || request.resource.data.startedAtMs is number)
+        && (request.resource.data.answers is map)
+        && (request.resource.data.questions is list) && request.resource.data.questions.size() <= 120
+        && (request.resource.data.mcqCorrect is int || request.resource.data.mcqCorrect is number)
+        && (request.resource.data.mcqTotal is int || request.resource.data.mcqTotal is number)
+        && (request.resource.data.percent is int || request.resource.data.percent is number)
+        && isPlainText(request.resource.data.examTitle, 0, 200)
+        && (request.resource.data.ownerUid == null || request.resource.data.ownerUid is string)
+        && (request.resource.data.autoSubmitted is bool)
+        && (request.resource.data.attemptMetaId == null || request.resource.data.attemptMetaId is string)
+        && (request.resource.data.details == null || request.resource.data.details is map)
+        && isShortString(request.resource.data.ua, 0, 400)
+        && isShortString(request.resource.data.lang, 0, 40)
+      );
+      // Read: Admin, or the owner teacher of the related exam, or an assistant with appropriate perms
+      allow read: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null && (
+          get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'viewSubmissions') ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams')
+        )
+      );
+      // Allow Admin to update anything. Also allow the Teacher who owns the exam
+      // or an assistant with 'viewSubmissions' or 'manageExams' to update ONLY grading-related fields for text questions.
+      allow update: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null && (
+          get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'viewSubmissions') ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams')
+        )
+      ) && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          'textScores', 'textComments', 'textTotal', 'gradedByUid', 'gradedAt',
+          'gradedByName', 'gradedByRole', 'gradedHistory'
+        ]);
+      // Delete: previously only Admin or exact exam owner. Expanded to allow assistants with appropriate perms
+      // and a fallback if submission doc stores examOwnerUid (to avoid an extra read when present or if examId missing).
+      allow delete: if hasRole('Admin') || (
+        isSignedIn() && (
+          (
+            resource.data.examId != null && (
+              get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+              assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams') ||
+              assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'viewSubmissions')
+            )
+          ) || (
+            // Fallback: allow if the submission doc itself contains an explicit examOwnerUid matching the caller
+            resource.data.examOwnerUid != null && resource.data.examOwnerUid == request.auth.uid
+          )
+        )
+      );
+    }
+
+    // Reattempt grant tokens: enable teachers to grant one extra attempt via a short link
+    // Document shape (suggested): { code: string, examId: string, ownerUid: string, createdAt: ts, expiresAt: ts, consumed: bool, consumedAt: ts? }
+    match /exam_reattempt_grants/{code} {
+      // Read by anyone holding the code, but only if not expired
+      allow read: if true && resource.data.expiresAt != null && request.time < resource.data.expiresAt;
+      // Create by Admin or any signed-in owner of the referenced exam
+      allow create: if hasRole('Admin') || (
+        isSignedIn() && request.resource.data.examId != null && (
+          // Exam owner can create
+          get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.ownerUid == request.auth.uid
+          // Assistants with manageExams for the exam owner can also create
+          || assistantHasPermFor(get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.ownerUid, 'manageExams')
+        )
+      );
+      // Update: allow Admin or the exam owner (client typically won't update)
+      allow update: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null &&
+        get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid
+      );
+      // Delete by Admin or the exam owner
+      allow delete: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null &&
+        get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid
+      );
+    }
+
+    // Single-use claims for reattempt codes to prevent multiple submissions per link
+    // Path: /reattempt_claims/{code}
+    // Shape: { examId: string, claimedAt: ts }
+    match /reattempt_claims/{code} {
+      // Allow read by anyone so the client can detect already-used links early
+      allow read: if true;
+      // Create allowed once per code, only when a matching, unexpired grant exists and examId matches
+      allow create: if (
+        request.resource.data.examId != null &&
+        // The grant must exist and be valid (not expired)
+        exists(/databases/$(database)/documents/exam_reattempt_grants/$(code)) &&
+        get(/databases/$(database)/documents/exam_reattempt_grants/$(code)).data.expiresAt != null &&
+        request.time < get(/databases/$(database)/documents/exam_reattempt_grants/$(code)).data.expiresAt &&
+        // The claim's examId must match the grant's examId
+        get(/databases/$(database)/documents/exam_reattempt_grants/$(code)).data.examId == request.resource.data.examId &&
+        // Ensure single-use: no existing claim doc
+        !exists(/databases/$(database)/documents/reattempt_claims/$(code))
+      );
+      // Updates disallowed (immutable once created). Allow controlled deletes:
+      //  - Admin
+      //  - Exam owner (teacher) of the referenced exam
+      //  - Assistant with manageExams permission for that exam's owner
+      allow update: if false;
+      allow delete: if hasRole('Admin') || (
+        isSignedIn() && resource.data.examId != null && (
+          get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid == request.auth.uid ||
+          assistantHasPermFor(get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.ownerUid, 'manageExams')
+        )
+      );
+    }
+    // New: Feedback programmes management (separate from general events)
+    match /feedbackEvents/{docId} {
+      allow read: if true; // students/public need to view current programme & volunteers list
+      // Restrict writes to Admin only (finance roles do not manage feedback programmes)
+      allow write: if hasRole('Admin');
+    }
+    // Calendar days used to power the public Events Calendar
+    match /calendarDays/{docId} {
+      allow read: if true;
+      // Finance roles have no write here; only Admin or explicit delegation may write
+      allow write: if hasRole('Admin') || hasActiveDelegation('canManageEvents');
+    }
+    match /gallery/{docId} {
+      allow read: if true;
+      // Finance roles have no write here; only Admin or explicit delegation may write
+      allow write: if hasRole('Admin') || hasActiveDelegation('canManageGallery');
+    }
+
+    // ---------- Library (Physical Books) ----------
+    // Catalog of physical books: managed by Admin; readable by public
+    match /libraryBooks/{bookId} {
+      allow read: if true;
+      // Only Admin can create/update; restrict fields via client validation
+      allow create, update, delete: if hasRole('Admin');
+    }
+    // Reservations placed by signed-in users; server-side invariants enforced by security
+    // Shape: { bookId: string, userUid: string, status: 'active'|'cancelled'|'fulfilled', placedAt, cancelledAt?, expiresAt? }
+    match /libraryReservations/{resId} {
+      // Allow the owner or Admin to read reservation docs
+      allow read: if isSignedIn() && (request.auth.uid == resource.data.userUid || hasRole('Admin'));
+      // Block direct client writes; all writes go through Cloud Functions for atomicity
+      allow create, update, delete: if hasRole('Admin');
+    }
+    // Public reservation requests (anonymous or signed-in) captured for librarian processing
+    // Shape: { bookId: string, name: string, phone: string, parentage: string?, address: string, pin: string?, pickupDate: string?, notes: string?, createdAt: timestamp, status: 'pending' }
+    // Public reservation requests (anonymous or signed-in)
+    match /libraryReservationRequests/{reqId} {
+      // Public create allowed, but validate fields to reduce abuse/stored-XSS.
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'bookId','userUid','createdAt','status',
+          'name','phone','email','parentage','address','pin','pickupDate','notes','terms'
+        ])
+        && (request.resource.data.bookId is string)
+        && (request.resource.data.userUid == null || request.resource.data.userUid is string)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.status == 'pending')
+        && isPlainText(request.resource.data.name, 2, 120)
+        && isPhoneDigits(request.resource.data.phone, 7, 25)
+        && isEmail(request.resource.data.email)
+        && isPlainText(request.resource.data.parentage, 1, 120)
+        && isPlainText(request.resource.data.address, 3, 300)
+        && isPlainText(request.resource.data.pin, 3, 20)
+        && isPlainText(request.resource.data.pickupDate, 4, 40)
+        && isOptionalPlainText('notes', 0, 600)
+        && (request.resource.data.terms is list) && request.resource.data.terms.size() <= 30
+      );
+      
+      allow read: if hasRole('Admin') || (isSignedIn() && resource.data.userUid == request.auth.uid);
+
+      allow update, delete: if hasRole('Admin');
+    }
+
+    // Public reports for returns submitted from the public catalog (guest or signed-in)
+    // Document shape (suggested): { trackingId?, loanId?, bookId?, bookTitle?, note?, reporterUid?, reporterName?, status?, createdAt }
+    match /libraryReturnReports/{repId} {
+      // Allow anyone to submit a report (signed-in or anonymous)
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'trackingId','loanId','bookId','bookTitle','note','reporterUid','reporterName','status','createdAt'
+        ])
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.status == null || request.resource.data.status == 'pending')
+        && (request.resource.data.reporterUid == null || request.resource.data.reporterUid is string)
+        && isOptionalPlainText('trackingId', 0, 80)
+        && isOptionalPlainText('loanId', 0, 80)
+        && isOptionalPlainText('bookId', 0, 120)
+        && isOptionalPlainText('bookTitle', 0, 200)
+        && isOptionalPlainText('reporterName', 0, 120)
+        && isOptionalPlainText('note', 0, 800)
+      );
+
+      // Admins or delegated library managers may read and list reports
+      allow get, list: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+
+      // Allow reporter to read/delete their own report if they were signed-in when submitting
+      allow read: if isSignedIn() && resource.data.reporterUid == request.auth.uid;
+      allow delete: if hasRole('Admin') || (isSignedIn() && resource.data.reporterUid == request.auth.uid);
+
+      // Prevent client-side updates to reports to keep admin as the single editor
+      allow update: if hasRole('Admin');
+    }
+
+    // Public library feedback submissions (anonymous allowed)
+    // Document shape: { name?: string, contact?: string, message: string, createdAt: timestamp }
+    match /libraryFeedback/{fbId} {
+      // Allow anyone (including unauthenticated) to create a feedback doc, but validate fields.
+      allow create: if (
+        // message required and reasonably sized (<= 4000 chars)
+        request.resource.data.message is string
+        && request.resource.data.message.size() <= 4000
+        // name and contact optional but must be strings when present and limited to 200 chars
+        && (
+          !('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() <= 200)
+        )
+        && (
+          !('contact' in request.resource.data) || (request.resource.data.contact is string && request.resource.data.contact.size() <= 200)
+        )
+      );
+
+      // Reads/listing restricted to Admins or delegated library managers
+      allow read, list: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+      // Allow Admins (role OR roles array), delegated library managers, or users with admin custom claim
+      allow update, delete: if hasRole('Admin') || hasAnyRole(['Admin']) || hasActiveDelegation('canManageLibrary') || (request.auth != null && (request.auth.token.admin == true || request.auth.token.role == 'Admin'));
+    }
+
+    // Loans: Admin managed
+    match /libraryLoans/{loanId} {
+      allow read: if hasRole('Admin') || (isSignedIn() && resource.data.userUid == request.auth.uid);
+
+      allow create, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- System Settings ----------
+    match /systemSettings/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- Meetings ----------
+    match /meetings/{meetingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- Inventory (Admin-only) ----------
+    // Path: /inventoryItems/{itemId}
+    // Document shape (suggested): { name, sku?, barcode?, quantity, reorderLevel?, location?, category?, supplier?, notes?, discontinued?, createdAt, updatedAt }
+    match /inventoryItems/{itemId} {
+      // Admin or delegated inventory manager
+      allow read, create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageInventory');
+    }
+
+    // ---------- Institute Students (Admin-managed, separate from Student Portal) ----------
+    // Path: /instituteStudents/{docId}
+    // Document shape (suggested): { fullName, fullNameLC, email?, phone?, gender?, notes?, createdByUid?, createdAt, updatedAt }
+    match /instituteStudents/{docId} {
+      // Admins (role OR roles array) or delegated institute-students managers
+      function canManageInstituteStudents() {
+        return hasRole('Admin') || hasAnyRole(['Admin']) || hasActiveDelegation('canManageInstituteStudents');
+      }
+      function isFormTeacherForGroup(groupName) {
+        return isSignedIn()
+          && hasAnyRole(['Teacher'])
+          && userProfileExists()
+          && groupName != null
+          && userProfile().data.farmTeacherGroup == groupName;
+      }
+
+      // Read access for form teachers is limited to their own group.
+      allow get: if canManageInstituteStudents() || isFormTeacherForGroup(resource.data.group);
+      // List: allow form teachers to read docs only for their own group.
+      // This is evaluated per returned document, so the client query must still filter by group.
+      allow list: if canManageInstituteStudents() || (
+        isSignedIn()
+        && hasAnyRole(['Teacher'])
+        && userProfileExists()
+        && resource.data.group == userProfile().data.farmTeacherGroup
+      );
+
+      allow create, update, delete: if canManageInstituteStudents();
+    }
+
+    // ---------- Form teacher per-student attendance (daily) ----------
+    // Collection: /form_teacher_student_attendance/{teacherUid}_{YYYY-MM-DD}
+    // Subcollection: /form_teacher_student_attendance/{dayId}/items/{studentId}
+    match /form_teacher_student_attendance/{dayId} {
+      function isFormTeacherDayDocCreate(dayId) {
+        return request.resource.data.keys().hasOnly([
+          'teacherUid','group','date','topicsTaught','createdAt','updatedAt'
+        ])
+        && (request.resource.data.teacherUid is string)
+        && isIsoDateYmd(request.resource.data.date)
+        && (dayId == (request.resource.data.teacherUid + '_' + request.resource.data.date))
+        && isPlainText(request.resource.data.group, 1, 80)
+        && isOptionalLongText('topicsTaught', 2000)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == request.time)
+        && (request.resource.data.updatedAt is timestamp)
+        && (request.resource.data.updatedAt == request.time);
+      }
+      function isFormTeacherDayDocUpdate(dayId) {
+        return request.resource.data.keys().hasOnly([
+          'teacherUid','group','date','topicsTaught','createdAt','updatedAt'
+        ])
+        && (resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == resource.data.createdAt)
+        && (request.resource.data.teacherUid == resource.data.teacherUid)
+        && (request.resource.data.date == resource.data.date)
+        && isOptionalLongText('topicsTaught', 2000)
+        && (request.resource.data.updatedAt is timestamp)
+        && (request.resource.data.updatedAt == request.time);
+      }
+
+      // Allow teachers to `get` their own day doc even when it doesn't exist yet.
+      // Otherwise Firestore returns PERMISSION_DENIED for missing docs.
+      function isOwnDayId(dayId) {
+        return isSignedIn() && (dayId.matches('^' + request.auth.uid + '_[0-9]{4}-[0-9]{2}-[0-9]{2}$'));
+      }
+
+      allow get: if hasAnyRole(['Admin']) || isOwnDayId(dayId) || (isSignedIn() && resource.data.teacherUid == request.auth.uid);
+      allow list: if hasAnyRole(['Admin']);
+      // Allow create when the teacher is assigned to the group.
+      // Accept legacy `farmTeacherGroup`, or `teacherGroup`, or membership in `teacherGroups`.
+      allow create: if (
+        isSignedIn()
+        && hasAnyRole(['Teacher'])
+        && request.resource.data.teacherUid == request.auth.uid
+        && isFormTeacherDayDocCreate(dayId)
+        && userProfileExists()
+        && (
+          userProfile().data.farmTeacherGroup == request.resource.data.group
+          || (userProfile().data.teacherGroup != null && userProfile().data.teacherGroup == request.resource.data.group)
+          || (userProfile().data.teacherGroups != null && (request.resource.data.group in userProfile().data.teacherGroups))
+        )
+      );
+      // Teachers cannot edit after saving; Admins can update/delete.
+      // Exception: teacher may update when admin granted an attendance override.
+      allow update: if (hasAnyRole(['Admin']) && isFormTeacherDayDocUpdate(dayId)) || (
+        isSignedIn()
+        && hasAnyRole(['Teacher'])
+        && resource.data.teacherUid == request.auth.uid
+        && isFormTeacherDayDocUpdate(dayId)
+        && hasAttendanceOverride(resource.data.date)
+      );
+      allow delete: if hasAnyRole(['Admin']);
+
+      match /items/{studentId} {
+        function isFormTeacherItemCreate() {
+          // Allow optional `leave` flag (teachers may mark leave instead of present/absent)
+          return request.resource.data.keys().hasOnly([
+            'studentId','studentName','present','leave','createdAt','updatedAt'
+          ])
+          && (request.resource.data.studentId is string)
+          && (request.resource.data.studentId == studentId)
+          && isOptionalPlainText('studentName', 0, 120)
+          && (request.resource.data.present is bool)
+          && ( !('leave' in request.resource.data) || (request.resource.data.leave is bool) )
+          && (request.resource.data.createdAt is timestamp)
+          && (request.resource.data.updatedAt is timestamp)
+          && (request.resource.data.updatedAt == request.time)
+          // If `leave` is true, ensure `present` is false to avoid conflicting state
+          && (
+            !('leave' in request.resource.data) || request.resource.data.leave == false
+            || (request.resource.data.leave == true && request.resource.data.present == false)
+          );
+        }
+        function isTeacherOwnerOfDay() {
+          return isSignedIn()
+            && exists(/databases/$(database)/documents/form_teacher_student_attendance/$(dayId))
+            && get(/databases/$(database)/documents/form_teacher_student_attendance/$(dayId)).data.teacherUid == request.auth.uid;
+        }
+        function dayGroup() {
+          return get(/databases/$(database)/documents/form_teacher_student_attendance/$(dayId)).data.group;
+        }
+        function studentIsInDayGroup() {
+          return exists(/databases/$(database)/documents/instituteStudents/$(studentId))
+            && get(/databases/$(database)/documents/instituteStudents/$(studentId)).data.group == dayGroup();
+        }
+
+        // IMPORTANT: In batched writes, rules cannot reliably "see" other docs being created
+        // in the same batch via exists()/get(). So item creation must be validated without
+        // requiring the parent day doc to already exist.
+        function studentIsInMyGroup() {
+          // Accept student belonging to the teacher's assigned group stored under
+          // `farmTeacherGroup`, `teacherGroup`, or within the `teacherGroups` array.
+          let studentGroup = get(/databases/$(database)/documents/instituteStudents/$(studentId)).data.group;
+          return userProfileExists()
+            && exists(/databases/$(database)/documents/instituteStudents/$(studentId))
+            && (
+              studentGroup == userProfile().data.farmTeacherGroup
+              || (userProfile().data.teacherGroup != null && studentGroup == userProfile().data.teacherGroup)
+              || (userProfile().data.teacherGroups != null && (studentGroup in userProfile().data.teacherGroups))
+            );
+        }
+
+        allow read: if hasAnyRole(['Admin']) || (isSignedIn() && isTeacherOwnerOfDay());
+        allow create: if (
+          isSignedIn()
+          && hasAnyRole(['Teacher'])
+          && isOwnDayId(dayId)
+          && studentIsInMyGroup()
+          && isFormTeacherItemCreate()
+        );
+        // Write-once for teachers; Admins can update/delete.
+        // Exception: teacher may update items when admin granted an attendance override.
+        allow update: if hasAnyRole(['Admin']) || (
+          isSignedIn()
+          && hasAnyRole(['Teacher'])
+          && isOwnDayId(dayId)
+          && isTeacherOwnerOfDay()
+          && studentIsInMyGroup()
+          && hasAttendanceOverride(
+               get(/databases/$(database)/documents/form_teacher_student_attendance/$(dayId)).data.date
+             )
+        );
+        allow delete: if hasAnyRole(['Admin']);
+      }
+    }
+
+    // ---------- Holidays ----------
+    // Path: /holidays/{holidayId}
+    match /holidays/{holidayId} {
+      allow read: if isSignedIn();
+      allow write: if hasRole('Admin');
+    }
+
+    // ---------- Student monthly fees (Form teacher entry; write-once per month) ----------
+    // Path: /student_fees/{studentId}/months/{YYYY-MM}
+    match /student_fees/{studentId} {
+      match /months/{monthId} {
+        function isYm(monthId) {
+          return monthId.matches('^[0-9]{4}-[0-9]{2}$');
+        }
+        function studentGroup() {
+          return get(/databases/$(database)/documents/instituteStudents/$(studentId)).data.group;
+        }
+        function canFormTeacherManageStudent() {
+          return isSignedIn()
+            && hasAnyRole(['Teacher'])
+            && userProfileExists()
+            && exists(/databases/$(database)/documents/instituteStudents/$(studentId))
+            && userProfile().data.farmTeacherGroup == studentGroup();
+        }
+        function isFeeCreateValid(studentId, monthId) {
+          return request.resource.data.keys().hasOnly([
+            'teacherUid','group','studentId','studentName','month','received','amount','createdAt','updatedAt'
+          ])
+          && (request.resource.data.teacherUid == request.auth.uid)
+          && (request.resource.data.studentId == studentId)
+          && (request.resource.data.month == monthId)
+          && isPlainText(request.resource.data.group, 1, 80)
+          && (request.resource.data.received == true)
+          && (request.resource.data.amount is number)
+          && (request.resource.data.amount >= 0)
+          && isOptionalPlainText('studentName', 0, 120)
+          && (request.resource.data.createdAt is timestamp)
+          && (request.resource.data.createdAt == request.time)
+          && (request.resource.data.updatedAt is timestamp)
+          && (request.resource.data.updatedAt == request.time);
+        }
+
+        // Teachers may get their own-group student's doc even if it doesn't exist yet.
+        allow get: if hasAnyRole(['Admin']) || (isYm(monthId) && canFormTeacherManageStudent());
+        allow list: if hasAnyRole(['Admin']);
+
+        // Write-once per month: create allowed, updates denied (except Admin).
+        allow create: if hasAnyRole(['Admin']) || (
+          isYm(monthId)
+          && canFormTeacherManageStudent()
+          && isFeeCreateValid(studentId, monthId)
+        );
+        allow update, delete: if hasAnyRole(['Admin']);
+      }
+    }
+
+    // ---------- Admin helper: allow reading any 'months' subcollection ----------
+    // Needed because collectionGroup('months') queries can match multiple features.
+    // Restrict to Admin only.
+    match /{anyPath=**}/months/{anyMonthDoc} {
+      allow read, list: if hasAnyRole(['Admin'])
+        || (request.auth != null && (request.auth.token.admin == true || request.auth.token.role == 'Admin'))
+        || (hasAnyRole(['Teacher']) && isSignedIn() && resource.data.teacherUid == request.auth.uid);
+    }
+
+    // ---------- Library Management ----------
+    // Admin/Delegated categories used for admin-side suggestions
+    match /libraryCategories/{catId} {
+      // Read is allowed for signed-in users so the admin UI can always populate suggestions.
+      // Writes remain restricted to Admin or delegated library managers.
+      allow read: if isSignedIn();
+      allow create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /libraryBooks/{bookId} {
+      // Public read (catalog), Admin/Delegated write
+      allow read: if true;
+      allow create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /libraryReservationRequests/{reqId} {
+      // Public create (request), Admin/Delegated manage
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'bookId','userUid','createdAt','status',
+          'name','phone','email','parentage','address','pin','pickupDate','notes','terms'
+        ])
+        && (request.resource.data.bookId is string)
+        && (request.resource.data.userUid == null || request.resource.data.userUid is string)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.status == 'pending')
+        && isPlainText(request.resource.data.name, 2, 120)
+        && isPhoneDigits(request.resource.data.phone, 7, 25)
+        && isEmail(request.resource.data.email)
+        && isPlainText(request.resource.data.parentage, 1, 120)
+        && isPlainText(request.resource.data.address, 3, 300)
+        && isPlainText(request.resource.data.pin, 3, 20)
+        && isPlainText(request.resource.data.pickupDate, 4, 40)
+        && isOptionalPlainText('notes', 0, 600)
+        && (request.resource.data.terms is list) && request.resource.data.terms.size() <= 30
+      );
+      allow read, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /libraryLoans/{loanId} {
+      // Admin/Delegated manage
+      allow read, create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /libraryReservations/{resId} {
+      // Admin/Delegated manage
+      allow read, create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+
+    // ---------- Library Book Admin Notes (private to admin) ----------
+    // Path: /libraryBookAdminNotes/{bookId}
+    // Document shape: { notes: string, updatedAt: timestamp, createdAt?: timestamp }
+    match /libraryBookAdminNotes/{bookId} {
+      // Only Admin or delegated library managers can read/write
+      allow read, create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+
+    // ---------- Library Book Private Fields (admin-only) ----------
+    // Path: /libraryBookPrivate/{bookId}
+    // Document shape (suggested): { priceInr?: number, createdAt?: timestamp, updatedAt: timestamp }
+    match /libraryBookPrivate/{bookId} {
+      // Only Admin or delegated library managers can read/write
+      allow read, create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+
+    // ---------- Library Sponsorship ----------
+    match /sponsorshipOpportunities/{oppId} {
+      // Public read (catalog), Admin/Delegated write
+      allow read: if true;
+      allow create, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /sponsorshipRequests/{reqId} {
+      // Public create (proposal), Admin/Delegated manage
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'sponsorName','sponsorContact','bookTitle','estimatedPrice','notes','status','createdAt'
+        ])
+        && isPlainText(request.resource.data.sponsorName, 2, 120)
+        && isPhoneDigits(request.resource.data.sponsorContact, 7, 25)
+        && isPlainText(request.resource.data.bookTitle, 2, 200)
+        && isOptionalPlainText('estimatedPrice', 0, 20)
+        && isOptionalPlainText('notes', 0, 800)
+        && request.resource.data.status == 'pending'
+        && (request.resource.data.createdAt is timestamp)
+      );
+      allow read, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+    match /sponsorshipIntents/{intentId} {
+      // Public create (payment intent), Admin/Delegated manage
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'type','bookId','bookTitle','sponsorName','sponsorPhone','amount','createdAt','status'
+        ])
+        && (!('type' in request.resource.data) || request.resource.data.type in ['general_donation'])
+        && (!('bookId' in request.resource.data) || request.resource.data.bookId is string)
+        && (!('bookTitle' in request.resource.data) || isPlainText(request.resource.data.bookTitle, 0, 200))
+        && isPlainText(request.resource.data.sponsorName, 2, 120)
+        && isPhoneDigits(request.resource.data.sponsorPhone, 7, 25)
+        && (request.resource.data.amount is int || request.resource.data.amount is number)
+        && request.resource.data.amount >= 0
+        && request.resource.data.amount <= 500000
+        && request.resource.data.status == 'pending_payment'
+        && (request.resource.data.createdAt is timestamp)
+      );
+      allow read, update, delete: if hasRole('Admin') || hasActiveDelegation('canManageLibrary');
+    }
+
+    // ---------- Instructor Portal ----------
+    // Top-level collection for instructor-authored courses
+    // Document shape (suggested): { title, description, createdAt, updatedAt, ownerUid }
+    match /instructorCourses/{courseId} {
+      // Allow Admin, Instructor, or Teacher to read courses
+      allow read: if hasAnyRole(['Admin', 'Instructor', 'Teacher']);
+
+      // Create: Admin or Instructor/Teacher creating their own course
+      allow create: if hasRole('Admin') || (
+        hasAnyRole(['Instructor','Teacher']) && request.resource.data.ownerUid == request.auth.uid
+      );
+
+      // Update/Delete: Admin, the owner (Instructor/Teacher), or an assigned assistant of the owner
+      allow update, delete: if hasRole('Admin') || (
+        hasAnyRole(['Instructor','Teacher']) && resource.data.ownerUid == request.auth.uid
+      ) || (
+        // Assistants may help manage the teacher's courses
+        isAssistantFor(resource.data.ownerUid)
+      );
+    }
+
+    // Subcollection for course materials under a course
+    // Path: /instructorCourses/{courseId}/materials/{materialId}
+    // Document shape (suggested): { title, type, content|url, createdAt, updatedAt, ownerUid, courseId }
+    match /instructorCourses/{courseId}/materials/{materialId} {
+      allow read: if hasAnyRole(['Admin', 'Instructor', 'Teacher']);
+      // Admin, the course owner, or an assigned assistant can write materials for that course
+      allow create, update, delete: if hasRole('Admin') || (
+        hasAnyRole(['Instructor','Teacher']) &&
+        get(/databases/$(database)/documents/instructorCourses/$(courseId)).data.ownerUid == request.auth.uid
+      ) || (
+        // Assistants can manage materials for the teacher's course
+        isAssistantFor(get(/databases/$(database)/documents/instructorCourses/$(courseId)).data.ownerUid)
+      );
+    }
+
+    // ---------- Assistants (Teacher → Assistant mapping) ----------
+    // Global mapping of a teacher to their assistant instructor UIDs
+    match /assistants/{teacherUid} {
+      // Readable by Admin, the Teacher themselves, and listed assistants
+      allow read: if hasRole('Admin')
+        || (isSignedIn() && request.auth.uid == teacherUid)
+        || isAssistantFor(teacherUid);
+      // Writable by Admin only (centralized management)
+      allow create, update, delete: if hasRole('Admin');
+    }
+    // Teacher-assigned permissions for their assistants
+    // Path: /assistants/{teacherUid}/perms/{assistantUid}
+    match /assistants/{teacherUid}/perms/{assistantUid} {
+      // Visibility: Admin, the teacher, and the assistant can read
+      allow read: if hasRole('Admin')
+        || (isSignedIn() && (request.auth.uid == teacherUid || request.auth.uid == assistantUid));
+      // Write: Admin or the teacher can set/update perms for assistants listed under them
+      allow create, update: if hasRole('Admin') || (
+        isSignedIn()
+        && request.auth.uid == teacherUid
+        && exists(/databases/$(database)/documents/assistants/$(teacherUid))
+        && (assistantUid in get(/databases/$(database)/documents/assistants/$(teacherUid)).data.assistantUids)
+        && request.resource.data.keys().hasOnly(['manageExams','viewAttempts','viewSubmissions','updatedAt','updatedByUid'])
+        && (!("manageExams" in request.resource.data) || (request.resource.data.manageExams == true || request.resource.data.manageExams == false))
+        && (!("viewAttempts" in request.resource.data) || (request.resource.data.viewAttempts == true || request.resource.data.viewAttempts == false))
+        && (!("viewSubmissions" in request.resource.data) || (request.resource.data.viewSubmissions == true || request.resource.data.viewSubmissions == false))
+      );
+      // Delete: Admin or the teacher may remove the perms doc
+      allow delete: if hasRole('Admin') || (isSignedIn() && request.auth.uid == teacherUid);
+    }
+    // Reverse index: which teachers an assistant helps
+    match /assistants_by_user/{assistantUid} {
+      // Readable by Admin and the Assistant themselves
+      allow read: if hasRole('Admin') || (isSignedIn() && request.auth.uid == assistantUid);
+      // Writable by Admin only
+      allow create, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Finance (Manager/Assistant) ----------
+    // Finance configuration doc (e.g., balance B/F and close markers)
+    match /finance/{docId} {
+      allow read: if hasAnyRole(['Manager', 'Assistant']);
+      allow write: if hasRole('Manager');
+    }
+    // Active finance records (income/expenditure)
+    match /finance_records/{recordId} {
+      allow read: if hasAnyRole(['Manager', 'Assistant']);
+      allow create, update: if hasAnyRole(['Manager', 'Assistant']);
+      allow delete: if hasRole('Manager');
+    }
+    // Archived finance records
+    match /finance_archive/{archiveId} {
+      allow read: if hasAnyRole(['Manager', 'Assistant']);
+      allow create: if hasAnyRole(['Manager', 'Assistant']);
+      allow update, delete: if false; // immutable archive
+    }
+    // Donation requests queue
+    match /donation_requests/{reqId} {
+      allow read: if hasAnyRole(['Manager', 'Assistant']);
+      // Public create allowed, but validate shape and block privileged fields.
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'fullName','amount','whatsappNumber','transactionId','screenshotURL','status','submittedAt'
+        ])
+        && isPlainText(request.resource.data.fullName, 2, 120)
+        && (request.resource.data.amount is int || request.resource.data.amount is number)
+        && request.resource.data.amount > 0
+        && request.resource.data.amount <= 500000
+        && isPhoneDigits(request.resource.data.whatsappNumber, 7, 25)
+        && isOptionalPlainText('transactionId', 0, 120)
+        && (request.resource.data.screenshotURL == null || isSafeHttpsUrl(request.resource.data.screenshotURL))
+        && (request.resource.data.status == null || request.resource.data.status == 'Pending')
+        && (request.resource.data.submittedAt is timestamp)
+      );
+      allow update: if hasAnyRole(['Manager', 'Assistant']);
+      allow delete: if hasRole('Manager');
+    }
+
+    // ---------- Public forms ----------
+    match /newsletterSubscribers/{docId} {
+      allow create: if (
+        request.resource.data.keys().hasOnly(['formType','newsletter-name','country-code','newsletter-phone','newsletter-email','timestamp'])
+        && request.resource.data.formType == 'newsletter'
+        && isPlainText(request.resource.data['newsletter-name'], 2, 120)
+        && isPlainText(request.resource.data['country-code'], 1, 8)
+        && isPhoneDigits(request.resource.data['newsletter-phone'], 7, 25)
+        && isEmail(request.resource.data['newsletter-email'])
+        && (request.resource.data.timestamp is timestamp)
+      );
+      // Management of subscribers is Admin-only; finance roles have no access here
+      allow read, update, delete: if hasRole('Admin');
+    }
+    match /feedback/{docId} {
+      allow create: if (
+        request.resource.data.keys().hasOnly(['formType','name','email','countryCode','phone','message','timestamp'])
+        && request.resource.data.formType == 'feedback'
+        && isPlainText(request.resource.data.name, 2, 120)
+        && (request.resource.data.email == null || request.resource.data.email == '' || isEmail(request.resource.data.email))
+        && isPlainText(request.resource.data.countryCode, 1, 8)
+        && isPhoneDigits(request.resource.data.phone, 7, 25)
+        && isPlainText(request.resource.data.message, 2, 5000)
+        && (request.resource.data.timestamp is timestamp)
+      );
+      // Management of feedback is Admin-only; finance roles have no access here
+      allow read, update, delete: if hasRole('Admin');
+    }
+
+    // Dedicated collection for structured volunteer feedback
+    match /volunteerFeedback/{docId} {
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'volunteerRef','volunteerName','overallRating','clarity','helpfulness','improvementAreas','comments',
+          'yourName','contact','attachment','submittedAt','context'
+        ])
+        && (
+          (request.resource.data.volunteerRef != null && request.resource.data.volunteerName == null) ||
+          (request.resource.data.volunteerRef == null && isPlainText(request.resource.data.volunteerName, 2, 120))
+        )
+        && (request.resource.data.overallRating is int || request.resource.data.overallRating is number)
+        && request.resource.data.overallRating >= 1 && request.resource.data.overallRating <= 5
+        && isPlainText(request.resource.data.clarity, 0, 40)
+        && isPlainText(request.resource.data.helpfulness, 0, 40)
+        && (request.resource.data.improvementAreas is list) && request.resource.data.improvementAreas.size() <= 12
+        && isOptionalPlainText('comments', 0, 2000)
+        && isPlainText(request.resource.data.yourName, 2, 120)
+        && isOptionalPlainText('contact', 0, 120)
+        && (request.resource.data.attachment == null || isShortString(request.resource.data.attachment, 0, 900000))
+        && (request.resource.data.submittedAt is timestamp)
+        && (request.resource.data.context is map)
+        && request.resource.data.context.keys().hasOnly(['userAgent','referrer','page'])
+        && (request.resource.data.context.userAgent == null || isShortString(request.resource.data.context.userAgent, 0, 400))
+        && (request.resource.data.context.referrer == null || isPlainText(request.resource.data.context.referrer, 0, 800))
+        && (request.resource.data.context.page == null || isPlainText(request.resource.data.context.page, 0, 800))
+      );
+      // Admin-only management; finance roles have no access here
+      allow read, update, delete: if hasRole('Admin');
+    }
+    match /programmeFeedback/{docId} {
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'programmeRating','programmeCommentsPositive','programmeCommentsImprovement','programmeSubmitterName','programmeSubmitterPhone',
+          'organization','content','speaker','source','attachment','submittedAt'
+        ])
+        && (request.resource.data.programmeRating is int || request.resource.data.programmeRating is number)
+        && request.resource.data.programmeRating >= 1 && request.resource.data.programmeRating <= 5
+        && isOptionalPlainText('programmeCommentsPositive', 0, 2000)
+        && isOptionalPlainText('programmeCommentsImprovement', 0, 2000)
+        && isOptionalPlainText('programmeSubmitterName', 0, 120)
+        && (request.resource.data.programmeSubmitterPhone == null || isPhoneDigits(request.resource.data.programmeSubmitterPhone, 7, 25))
+        && isPlainText(request.resource.data.organization, 0, 40)
+        && isPlainText(request.resource.data.content, 0, 40)
+        && isPlainText(request.resource.data.speaker, 0, 40)
+        && isPlainText(request.resource.data.source, 0, 60)
+        && (request.resource.data.attachment == null || isShortString(request.resource.data.attachment, 0, 900000))
+        && (request.resource.data.submittedAt is timestamp)
+      );
+      // Admin-only management; finance roles have no access here
+      allow read, update, delete: if hasRole('Admin');
+    }
+    // Feedback from exams page (Help us improve modal)
+    match /exam_feedback/{docId} {
+      allow create: if (
+        request.resource.data.keys().hasOnly([
+          'message','name','email','rating','page','examId','examTitle','createdAt','createdAtMs','ua','lang'
+        ])
+        && isPlainText(request.resource.data.message, 2, 3000)
+        && (request.resource.data.name == null || isPlainText(request.resource.data.name, 0, 120))
+        && (request.resource.data.email == null || request.resource.data.email == '' || isEmail(request.resource.data.email))
+        && (request.resource.data.rating == null || request.resource.data.rating in [1,2,3,4,5])
+        && isPlainText(request.resource.data.page, 1, 40)
+        && (request.resource.data.examId == null || request.resource.data.examId is string)
+        && (request.resource.data.examTitle == null || isPlainText(request.resource.data.examTitle, 0, 200))
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAtMs is int || request.resource.data.createdAtMs is number)
+        && isShortString(request.resource.data.ua, 0, 400)
+        && isShortString(request.resource.data.lang, 0, 40)
+      );
+      // Admin can manage; finance roles have no access here
+      allow read, update, delete: if hasRole('Admin');
+    }
+
+    // ---------- Community & Support (Student portal) ----------
+    match /communityCarpoolPosts/{docId} {
+      // Students can read the board; organizers/admin can manage
+      allow read: if isSignedIn();
+      allow create: if (
+        isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          'type','from','to','date','time','seats','contact','createdByName','createdByUid','note','createdAt'
+        ])
+        && (request.resource.data.type in ['offer','request'])
+        && isPlainText(request.resource.data.from, 1, 60)
+        && isPlainText(request.resource.data.to, 1, 60)
+        && (request.resource.data.date == null || isIsoDateYmd(request.resource.data.date))
+        && (request.resource.data.time == null || isTimeHm(request.resource.data.time))
+        && (request.resource.data.seats == null || (request.resource.data.seats is int && request.resource.data.seats >= 1 && request.resource.data.seats <= 10))
+        && (request.resource.data.contact == null || isPhoneDigits(request.resource.data.contact, 6, 25))
+        && isPlainText(request.resource.data.createdByName, 2, 60)
+        && (request.resource.data.createdByUid is string)
+        && (request.resource.data.createdByUid == request.auth.uid)
+        && (request.resource.data.note == null || isPlainText(request.resource.data.note, 0, 300))
+        && (request.resource.data.createdAt is timestamp)
+      );
+      allow update, delete: if hasAnyRole(['Admin','ProgramOrganizer']);
+    }
+
+    match /communityTransportRequests/{docId} {
+      // Students can create transport requests and read their own.
+      // ProgramOrganizer/Admin can view all and accept/reject.
+      allow read: if isSignedIn() && (
+        hasAnyRole(['Admin','ProgramOrganizer'])
+        || resource.data.createdByUid == request.auth.uid
+      );
+
+      allow create: if (
+        isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          'programId','direction','pickupLocation','createdByName','createdByPhone','createdByUid','note','status','createdAt'
+        ])
+        && (request.resource.data.programId == null || isPlainText(request.resource.data.programId, 1, 120))
+        && (request.resource.data.direction in ['toVenue','fromVenue'])
+        && isPlainText(request.resource.data.pickupLocation, 2, 80)
+        && isPlainText(request.resource.data.createdByName, 2, 60)
+        && (request.resource.data.createdByPhone == null || isPhoneDigits(request.resource.data.createdByPhone, 6, 25))
+        && (request.resource.data.createdByUid is string)
+        && (request.resource.data.createdByUid == request.auth.uid)
+        && (request.resource.data.note == null || isPlainText(request.resource.data.note, 0, 300))
+        && request.resource.data.status == 'pending'
+        && (request.resource.data.createdAt is timestamp)
+      );
+
+      allow update: if (
+        hasAnyRole(['Admin','ProgramOrganizer'])
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','decidedAt','decidedByUid'])
+        && (request.resource.data.status in ['pending','accepted','rejected'])
+        && (request.resource.data.decidedAt is timestamp)
+        && (request.resource.data.decidedAt == request.time)
+        && (request.resource.data.decidedByUid is string)
+        && (request.resource.data.decidedByUid == request.auth.uid)
+      );
+
+      allow delete: if hasAnyRole(['Admin','ProgramOrganizer']);
+    }
+
+    match /communityLostFoundPosts/{docId} {
+      allow read: if isSignedIn();
+      allow create: if (
+        isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          'kind','item','description','location','contact','status','createdByName','createdByUid','createdAt'
+        ])
+        && (request.resource.data.kind in ['lost','found'])
+        && isPlainText(request.resource.data.item, 2, 80)
+        && isPlainText(request.resource.data.description, 2, 500)
+        && (request.resource.data.location == null || isPlainText(request.resource.data.location, 0, 80))
+        && (request.resource.data.contact == null || isPhoneDigits(request.resource.data.contact, 6, 25))
+        && (request.resource.data.status in ['open','resolved'])
+        && isPlainText(request.resource.data.createdByName, 2, 60)
+        && (request.resource.data.createdByUid is string)
+        && (request.resource.data.createdByUid == request.auth.uid)
+        && (request.resource.data.createdAt is timestamp)
+      );
+      allow update, delete: if hasAnyRole(['Admin','ProgramOrganizer']);
+    }
+
+    match /communitySuggestions/{docId} {
+      // Anonymous suggestion box: students can submit, but only organizers/admin can read.
+      allow read, update, delete: if hasAnyRole(['Admin','ProgramOrganizer']);
+      allow create: if (
+        isSignedIn()
+        && request.resource.data.keys().hasOnly(['category','message','createdAt','context'])
+        && (request.resource.data.category == null || isPlainText(request.resource.data.category, 0, 30))
+        && isPlainText(request.resource.data.message, 2, 3000)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.context is map)
+        && request.resource.data.context.keys().hasOnly(['page'])
+        && (request.resource.data.context.page == null || isPlainText(request.resource.data.context.page, 0, 120))
+      );
+    }
+    // ---------- Tasks (core app) ----------
+    match /tasks/{taskId} {
+      // Read for dashboards/leaderboards
+      allow read: if isSignedIn();
+      // Create by Admin or delegated volunteers
+      allow create: if hasRole('Admin') || hasActiveDelegation('canCreateTasks');
+      // Update rules:
+      allow update: if hasRole('Admin')
+        // Assignee or sub-assignee can update their task (status, messages, attachments, etc.)
+        || (isSignedIn() && resource.data.assignedToUid == request.auth.uid)
+        || (isSignedIn() && resource.data.subAssigneeUid == request.auth.uid)
+        // Claiming unclaimed tasks
+        || (isSignedIn() && resource.data.status == 'Unclaimed' && request.resource.data.assignedToUid == request.auth.uid)
+        // Creator approval/rejection during Pending Creator Review; allow optional messages
+        || (
+          isSignedIn()
+          && (resource.data.createdByUid == request.auth.uid || resource.data.createdByEmail == request.auth.token.email)
+          && resource.data.status == 'Pending Creator Review'
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','lastUpdated','messages'])
+          && (request.resource.data.status == 'Pending Review' || request.resource.data.status == 'In Progress')
+        )
+        // Creator streamline: allow creator to set status to Pending Review/In Progress with only status/lastUpdated
+        || (
+          isSignedIn()
+          && (resource.data.createdByUid == request.auth.uid || resource.data.createdByEmail == request.auth.token.email)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','lastUpdated'])
+          && (request.resource.data.status == 'Pending Review' || request.resource.data.status == 'In Progress')
+        )
+        // Legacy tasks without createdByUid: match by assignedBy name/email
+        || (
+          isSignedIn()
+          && resource.data.createdByUid == null
+          && (resource.data.assignedBy == userProfile().data.fullName || resource.data.assignedBy == userProfile().data.email)
+          && resource.data.status == 'Pending Creator Review'
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','lastUpdated'])
+          && (request.resource.data.status == 'Pending Review' || request.resource.data.status == 'In Progress')
+        )
+        || (
+          isSignedIn()
+          && resource.data.createdByUid == null
+          && (resource.data.assignedBy == userProfile().data.fullName || resource.data.assignedBy == userProfile().data.email)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','lastUpdated'])
+          && (request.resource.data.status == 'Pending Review' || request.resource.data.status == 'In Progress')
+        )
+        // Creator chat: append messages anytime (messages + lastUpdated only)
+        || (
+          isSignedIn()
+          && (resource.data.createdByUid == request.auth.uid || resource.data.createdByEmail == request.auth.token.email)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['messages','lastUpdated'])
+        )
+        // Legacy creator chat
+        || (
+          isSignedIn()
+          && resource.data.createdByUid == null
+          && (resource.data.assignedBy == userProfile().data.fullName || resource.data.assignedBy == userProfile().data.email)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['messages','lastUpdated'])
+        );
+      // Delete by Admin only
+      allow delete: if hasRole('Admin');
+    }
+
+    // ---------- Groups & misc ----------
+    match /groups/{groupId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if hasRole('Admin');
+    }
+    // Student groups managed from Admin portal
+    match /student_groups/{groupId} {
+      // Admin can fully manage groups (create/list/update/delete)
+      allow read, create, update, delete: if hasRole('Admin');
+    }
+    match /audit_logs/{logId} {
+      allow read: if hasRole('Admin');
+      allow create: if hasRole('Admin');
+      allow update, delete: if false;
+    }
+    match /sent_notifications/{id} {
+      // Admins and Program Organizers can fully manage (read/delete).
+      allow read, delete: if hasRole('Admin') || isProgramOrganizerRole();
+      // Allow create by Admin, Program Organizer OR a single recipient creating a thread for themselves when replying
+      allow create: if hasRole('Admin') || isProgramOrganizerRole() || (
+        isSignedIn() &&
+        // Must include user's email (threads index by email recipients)
+        (request.auth.token.email in request.resource.data.recipients) &&
+        // Single-recipient self-started thread only
+        request.resource.data.recipients.size() == 1 &&
+        // Field whitelist for safety
+        request.resource.data.keys().hasOnly(['subject','body','recipients','timestamp','replies']) &&
+        (request.resource.data.subject is string) &&
+        (request.resource.data.body is string) &&
+        (request.resource.data.recipients is list) &&
+        (request.resource.data.replies is list)
+      );
+      // Updates:
+      // - Admin or Program Organizer: full update
+      // - Recipient: may append to the replies array only (for replying to a message)
+      allow update: if
+        hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn() &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['replies']) &&
+          (userProfile().data.email in resource.data.recipients)
+        );
+    }
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if hasRole('Admin');
+    }
+
+    // ---------- Students (denormalized view) ----------
+    // Path: /students/{uid}
+    // Mirrors a subset of the Student profile for easier listing and queries.
+    match /students/{uid} {
+      // Read allowed for: Admin, ProgramOrganizer, and the student themselves
+      allow read: if hasRole('Admin') || isProgramOrganizerRole() || hasActiveDelegation('canManageLibrary') || (isSignedIn() && request.auth.uid == uid);
+      // Create allowed only for Admin OR (self heartbeat only).
+      // NOTE: Prevent students from self-creating an arbitrary profile/status via the /students denormalized view.
+      allow create: if hasRole('Admin') || (
+        isSignedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['lastSeen', 'seenResources', 'pinnedResources', 'notifsRead', 'notifsDismissed'])
+        && (request.resource.data.lastSeen is timestamp)
+        && (request.resource.data.lastSeen <= request.time)
+        && (
+          !exists(/databases/$(database)/documents/users/$(uid)) ||
+          get(/databases/$(database)/documents/users/$(uid)).data.role == 'Student' || (
+            get(/databases/$(database)/documents/users/$(uid)).data.roles != null && ('Student' in get(/databases/$(database)/documents/users/$(uid)).data.roles)
+          )
+        )
+      );
+      // Updates:
+      // - Admin: full update
+      // - Student (self): may update lastSeen heartbeat OR their own addons map
+      // - ProgramOrganizer: may update approval status or addon statuses
+      allow update: if hasRole('Admin') || (
+        isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['lastSeen'])
+        && (request.resource.data.lastSeen is timestamp)
+        && (request.resource.data.lastSeen <= request.time)
+      ) || (
+        // Student can update their own FCM push token for notifications
+        isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['fcmTokens'])
+        && (request.resource.data.fcmTokens is list)
+      ) || (
+        // Student can sync their notifications and resource state
+        isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['notifsRead', 'notifsDismissed', 'seenResources', 'pinnedResources'])
+      ) || (
+        // Student can write their own addons map
+        isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['addons'])
+      ) || (
+        isProgramOrganizerRole()
+        && (
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['status', 'approvedAt', 'approvedBy', 'rejectedAt', 'rejectedBy'])
+          || request.resource.data.diff(resource.data).changedKeys().hasOnly(['addons'])
+          || request.resource.data.diff(resource.data).changedKeys().hasOnly(['hasPendingChangeRequest', 'pendingChangeRequest', 'fullName', 'parentage', 'phone', 'gender', 'address', 'pin', 'altPhone', 'skills', 'availability', 'username', 'usernameLC', 'lastUsernameChange', 'email', 'dob', 'qualification', 'currentOccupation'])
+        )
+        && (
+          !request.resource.data.diff(resource.data).changedKeys().hasAny(['status'])
+          || (request.resource.data.status is string
+            && (request.resource.data.status in ['Approved','Pending','Rejected','Blacklisted']))
+        )
+      );
+      // Delete restricted to Admin only (prevent privilege escalation)
+      allow delete: if hasRole('Admin');
+
+      // Notifications subcollection read by students
+      match /notifications/{notifId} {
+        allow read: if (isSignedIn() && request.auth.uid == uid) || hasRole('Admin');
+        allow write: if hasRole('Admin');
+      }
+
+      // Attendance subcollection written by Program Organizers during on-site check-in
+      // Path: /students/{uid}/attendance/{attId}
+      // Document shape (suggested): { programId, programTitle?, checkedInAt, organizerUid }
+      match /attendance/{attId} {
+        // Read: owner, Admin, or ProgramOrganizer
+        allow read: if (isSignedIn() && request.auth.uid == uid) || hasRole('Admin') || isProgramOrganizerRole();
+        // Create: ProgramOrganizer or Admin. Prevent spoofing organizerUid to other value than caller.
+        allow create: if (hasRole('Admin') || isProgramOrganizerRole())
+          && request.resource.data.organizerUid == request.auth.uid
+          && request.resource.data.programId is string
+          && (
+            request.resource.data.checkedInAt is timestamp ||
+            request.resource.data.checkedOutAt is timestamp
+          );
+        // Updates not allowed from client; deletes only by Admin
+        allow update: if false;
+        allow delete: if hasRole('Admin');
+      }
+
+      // Certificates subcollection earned by the student
+      match /certificates/{certId} {
+        // Read: owner, Admin, or ProgramOrganizer
+        allow read: if (isSignedIn() && request.auth.uid == uid) || hasRole('Admin') || isProgramOrganizerRole();
+        // Create/Update/Delete: Admin or ProgramOrganizer only
+        allow write: if hasRole('Admin') || isProgramOrganizerRole();
+      }
+
+      // Enrollments subcollection
+      match /enrollments/{enrId} {
+        allow read: if (isSignedIn() && request.auth.uid == uid) || hasRole('Admin') || isProgramOrganizerRole() || hasRole('Teacher');
+        allow write: if hasRole('Admin') || isProgramOrganizerRole();
+      }
+
+      // Performance subcollection
+      match /performance/{perfId} {
+        allow read: if (isSignedIn() && request.auth.uid == uid) || hasRole('Admin') || isProgramOrganizerRole() || hasRole('Teacher');
+        allow write: if hasRole('Admin') || isProgramOrganizerRole() || hasRole('Teacher');
+      }
+    }
+
+    // ---------- Programs & Registrations (Organizer Portal) ----------
+    // Program document shape (expected minimal fields referenced in rules):
+    // { title, description, visibility, capacity, registeredCount, waitlistEnabled, createdBy, createdByEmail, startDate, endDate, registrationDeadline, createdAt, updatedAt }
+    // Access model:
+    // - Admin: full control
+    // - ProgramOrganizer role (either role == 'ProgramOrganizer' OR in roles array): read/write programs; manage registrations
+    // - Other signed-in users: read only Published programs (for future public/student catalog) – currently restrict to Admin/Organizer until needed
+    function isOrganizerAssistant() {
+      return userProfileExists()
+        && userProfile().data.get('role', '') == 'Volunteer'
+        && 'organizerPermissions' in userProfile().data
+        && 'active' in userProfile().data.organizerPermissions
+        && userProfile().data.organizerPermissions.active == true
+        && (
+          !('expiresAt' in userProfile().data.organizerPermissions)
+          || userProfile().data.organizerPermissions.expiresAt == null
+          || (userProfile().data.organizerPermissions.expiresAt is timestamp && request.time < userProfile().data.organizerPermissions.expiresAt)
+        );
+    }
+    function hasOrganizerPermission(perm) {
+      return userProfileExists() && (
+        userProfile().data.get('role', '') != 'Volunteer' ||
+        userProfile().data.get('organizerPermissions', {}).get(perm, false) == true
+      );
+    }
+
+    function isProgramOrganizerRole() {
+      return userProfileExists() && (
+        userProfile().data.get('role', '') == 'ProgramOrganizer' ||
+        (userProfile().data.get('roles', []) is list && userProfile().data.get('roles', []).hasAny(['ProgramOrganizer'])) ||
+        isOrganizerAssistant()
+      );
+    }
+
+
+    // Student approval gating
+    // Legacy compatibility: treat older 'Active' status as Approved.
+    function studentApprovalStatus(uid) {
+      return exists(/databases/$(database)/documents/students/$(uid))
+        ? get(/databases/$(database)/documents/students/$(uid)).data.status
+        : null;
+    }
+    function isApprovedStudent(uid) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/students/$(uid))
+        && (studentApprovalStatus(uid) in ['Approved','Active']);
+    }
+    match /programs/{programId} {
+      // Read: Admin or Program Organizer OR any signed-in user for Published programs (students see catalog)
+      allow read: if hasRole('Admin') || isProgramOrganizerRole() || (
+        // Students: only Approved may read Published programs
+        isApprovedStudent(request.auth.uid) && resource.data.visibility == 'Published'
+      );
+      // Create: Admin or Program Organizer
+      allow create: if hasRole('Admin') || isProgramOrganizerRole();
+      // Update: Admin unrestricted; Program Organizer cannot change server-maintained fields
+      allow update: if hasRole('Admin') || (
+        isProgramOrganizerRole() &&
+        !request.resource.data.diff(resource.data).changedKeys().hasAny(['createdBy','createdByEmail','coverPath','coverImage'])
+      );
+      // Delete: Admin or Program Organizer
+      allow delete: if hasRole('Admin') || isProgramOrganizerRole();
+
+      // Subcollection: registrations
+      // Document shape (minimum referenced): { studentUid, createdAt, waitlisted?, rejected? }
+      // Writes come from clients (simulate/dev) or real student enrollment flows + cloud functions adding flags.
+      // Rules:
+      // - Create: Any signed-in user may attempt to register (studentUid must equal auth.uid) OR an organizer in dev/test contexts.
+      // - Read: Admin or Program Organizer (organizer dashboard) and the student who owns their registration.
+      // - Update: Admin or Program Organizer (e.g., to annotate waitlist manually) BUT cloud functions use admin context (bypass rules).
+      // - Delete: Admin or Program Organizer (cancellation) OR the student who owns it (self cancel) while not yet rejected/waitlisted final.
+      match /registrations/{regId} {
+        allow read: if hasRole('Admin') || isProgramOrganizerRole() || (isSignedIn() && resource.data.studentUid == request.auth.uid);
+        // Enforce one registration per student per program by requiring doc id == auth uid and non-existing
+        allow create: if hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn()
+          && isApprovedStudent(request.auth.uid)
+          && (get(/databases/$(database)/documents/programs/$(programId)).data.visibility == 'Published')
+          && (
+            get(/databases/$(database)/documents/programs/$(programId)).data.get('registrationDeadline', null) == null ||
+            request.time <= get(/databases/$(database)/documents/programs/$(programId)).data.registrationDeadline
+          )
+          && regId == request.auth.uid
+          && !exists(/databases/$(database)/documents/programs/$(programId)/registrations/$(regId))
+          && (
+            // Student self-register only
+            request.resource.data.studentUid == request.auth.uid
+          )
+        );
+        // Update constraints: Only Admin/Organizer/Finance and only allowed decision fields, waitlist flag, on-site check-in fields, and transport details
+        allow update: if (
+          // Admin/Organizer/Finance can update decision fields, payment proof status, transport details, and attendance (recurring programs)
+          (hasRole('Admin') || isProgramOrganizerRole() || hasAnyRole(['Manager', 'Assistant', 'Finance'])) && (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly([
+              'approved','approvedAt','approvedBy','rejected','rejectedAt','rejectedBy','waitlisted',
+              'checkedIn','checkedInAt','checkedInBy',
+              'checkedOut','checkedOutAt','checkedOutBy',
+              'studentName','studentEmail','studentSource',
+              'paymentProofStatus', 'paymentProofSent', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId',
+              'requestTransport', 'pickupAddress', 'transportUpdatedAt', 'karvaanConsent', 'personalResources',
+              'attendance', 'lastAttendanceDate', 'attendanceLogs', 'lastAttendanceTimestamp'
+            ])
+          ) && (
+            (!request.resource.data.diff(resource.data).changedKeys().hasAny(['approved']) || request.resource.data.approved == true || request.resource.data.approved == false)
+          ) && (
+            (!request.resource.data.get('approved', false) || !request.resource.data.get('rejected', false))
+          )
+        ) || (
+          // Student can update their own registration to attach payment proof or manage transport details
+          isSignedIn() && request.auth.uid == resource.data.studentUid && (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly([
+              'paymentProofSent', 'paymentProofStatus', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId',
+              'requestTransport', 'pickupAddress', 'transportUpdatedAt', 'karvaanConsent'
+            ])
+          ) && (
+            !request.resource.data.diff(resource.data).changedKeys().hasAny([
+              'paymentProofSent', 'paymentProofStatus', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId'
+            ]) || request.resource.data.paymentProofStatus == 'pending'
+          )
+        );
+        // Allow student to delete (cancel) only their own active (non-waitlisted/rejected) registration
+        allow delete: if hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn() && resource.data.studentUid == request.auth.uid && !resource.data.rejected == true
+        );
+      } // End match /registrations/{regId}
+
+      // Subcollection: addon_registrations
+      match /addon_registrations/{addonId} {
+        allow read: if hasRole('Admin') || isProgramOrganizerRole() || (isSignedIn() && resource.data.addedByUid == request.auth.uid);
+        allow create: if isSignedIn()
+          && isApprovedStudent(request.auth.uid)
+          && (get(/databases/$(database)/documents/programs/$(programId)).data.visibility == 'Published')
+          && (
+            get(/databases/$(database)/documents/programs/$(programId)).data.get('registrationDeadline', null) == null ||
+            request.time <= get(/databases/$(database)/documents/programs/$(programId)).data.registrationDeadline
+          )
+          && request.resource.data.addedByUid == request.auth.uid;
+        allow update: if (
+          (hasRole('Admin') || isProgramOrganizerRole() || hasAnyRole(['Manager', 'Assistant', 'Finance'])) && (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly([
+              'approved','approvedAt','rejected','rejectedAt','waitlisted',
+              'paymentProofStatus', 'paymentProofSent', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId',
+              'requestTransport', 'pickupAddress', 'transportUpdatedAt'
+            ])
+          )
+        ) || (
+          isSignedIn() && request.auth.uid == resource.data.addedByUid && (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly([
+              'paymentProofSent', 'paymentProofStatus', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId',
+              'requestTransport', 'pickupAddress', 'transportUpdatedAt'
+            ])
+          ) && (
+            !request.resource.data.diff(resource.data).changedKeys().hasAny([
+              'paymentProofSent', 'paymentProofStatus', 'paymentProofBase64', 'paymentProofUrl', 'paymentProofUploadedAt', 'transactionId'
+            ]) || request.resource.data.paymentProofStatus == 'pending'
+          )
+        );
+        allow delete: if hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn() && resource.data.addedByUid == request.auth.uid && !resource.data.rejected == true
+        );
+      } // End match /addon_registrations/{addonId}
+
+      // Subcollection: rideshares (Karvaan System)
+      match /rideshares/{rideshareId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn()
+          && isApprovedStudent(request.auth.uid)
+          && request.resource.data.studentUid == request.auth.uid
+          && request.resource.data.status == 'pending'
+          && request.resource.data.consentGiven == true
+          && exists(/databases/$(database)/documents/programs/$(programId)/registrations/$(request.auth.uid))
+          && get(/databases/$(database)/documents/programs/$(programId)/registrations/$(request.auth.uid)).data.karvaanConsent == true;
+        allow update: if isSignedIn()
+          && (isApprovedStudent(request.auth.uid) || isAdmin() || isProgramOrganizerRole())
+          && (
+            // A student can accept a pending request
+            (
+              resource.data.status == 'pending' 
+              && request.resource.data.status == 'accepted'
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status', 'acceptedByUid', 'acceptedByName', 'acceptedAt'])
+              && request.resource.data.acceptedByUid == request.auth.uid
+              && resource.data.studentUid != request.auth.uid
+            ) ||
+            // An acceptor can cancel their acceptance
+            (
+              resource.data.status == 'accepted'
+              && request.resource.data.status == 'pending'
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status', 'acceptedByUid', 'acceptedByName', 'acceptedAt'])
+              && request.resource.data.acceptedByUid == ''
+              && resource.data.acceptedByUid == request.auth.uid
+            ) ||
+            // A student can cancel/update their own request
+            (resource.data.studentUid == request.auth.uid)
+          );
+        allow delete: if isSignedIn()
+          && (resource.data.studentUid == request.auth.uid || hasRole('Admin') || isProgramOrganizerRole());
+      }
+
+      // Subcollection: contact for rideshares (Karvaan System Privacy)
+      match /rideshares/{rideshareId}/contact/{contactDoc} {
+        allow read: if isSignedIn() && contactDoc == 'details' && (
+          !exists(/databases/$(database)/documents/programs/$(programId)/rideshares/$(rideshareId)) ||
+          get(/databases/$(database)/documents/programs/$(programId)/rideshares/$(rideshareId)).data.studentUid == request.auth.uid ||
+          get(/databases/$(database)/documents/programs/$(programId)/rideshares/$(rideshareId)).data.acceptedByUid == request.auth.uid ||
+          hasRole('Admin') || isProgramOrganizerRole()
+        );
+        allow create: if isSignedIn() && contactDoc == 'details' && (
+          request.resource.data.studentUid == request.auth.uid ||
+          request.resource.data.acceptedByUid == request.auth.uid
+        );
+        allow update: if isSignedIn() && contactDoc == 'details' && (
+          // Creator can update their own phone
+          (resource.data.studentUid == request.auth.uid && request.resource.data.diff(resource.data).changedKeys().hasOnly(['studentPhone'])) ||
+          // Acceptor can update or clear their own phone
+          (resource.data.acceptedByUid == request.auth.uid && request.resource.data.diff(resource.data).changedKeys().hasOnly(['acceptedByUid', 'acceptedByPhone'])) ||
+          (request.resource.data.acceptedByUid == request.auth.uid && request.resource.data.diff(resource.data).changedKeys().hasOnly(['acceptedByUid', 'acceptedByPhone']))
+        );
+        allow delete: if isSignedIn() && contactDoc == 'details' &&
+          (resource.data.studentUid == request.auth.uid || hasRole('Admin') || isProgramOrganizerRole());
+      }
+
+      // Subcollection: forum (discussion threads)
+      match /forum/{messageId} {
+        allow read: if hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn() && exists(/databases/$(database)/documents/programs/$(programId)/registrations/$(request.auth.uid))
+        );
+        allow create: if (hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn() && exists(/databases/$(database)/documents/programs/$(programId)/registrations/$(request.auth.uid))
+        ))
+          && request.resource.data.keys().hasOnly(['text', 'senderId', 'senderName', 'senderRole', 'createdAt', 'replyTo', 'threadId'])
+          && request.resource.data.senderId == request.auth.uid;
+        allow update: if hasRole('Admin') || isProgramOrganizerRole() || (
+          isSignedIn()
+          && exists(/databases/$(database)/documents/programs/$(programId)/registrations/$(request.auth.uid))
+          && (
+            request.resource.data.diff(resource.data).changedKeys().hasOnly(['reactions']) ||
+            (
+              resource.data.senderId == request.auth.uid 
+              && request.resource.data.diff(resource.data).changedKeys().hasOnly(['text', 'updatedAt'])
+              && (request.time.toMillis() - resource.data.createdAt.toMillis() <= 900000)
+            )
+          )
+        );
+        allow delete: if hasRole('Admin') || isProgramOrganizerRole();
+      } // End match /forum/{messageId}
+
+      // Subcollection: sessions (Recurring Programs — one doc per class day)
+      match /sessions/{sessionId} {
+        // Any signed-in user can read sessions (to validate class days)
+        allow read: if isSignedIn();
+        // Only Admin or Program Organizer can create/update/delete sessions
+        allow create, update, delete: if hasRole('Admin') || isProgramOrganizerRole();
+      } // End match /sessions/{sessionId}
+
+    } // End match /programs/{programId}
+
+    // Global collection group for registrations
+    match /{path=**}/registrations/{regId} {
+      allow read: if hasRole('Admin') || isProgramOrganizerRole() || (isSignedIn() && resource.data.studentUid == request.auth.uid);
+    }
+
+    // Global collection group for addon_registrations
+    match /{path=**}/addon_registrations/{addonId} {
+      allow read: if hasRole('Admin') || isProgramOrganizerRole() || (isSignedIn() && resource.data.addedByUid == request.auth.uid);
+    }
+
+    // ---------- Student Monthly Fees (Form Teacher) ----------
+    // Path: /student_fees/{studentId}/months/{YYYY-MM}
+    function isIsoMonthYm(v) {
+      // YYYY-MM
+      return (v is string) && v.matches('^[0-9]{4}-[0-9]{2}$');
+    }
+    function isMonthlyFeePayloadCommon(monthId) {
+      return request.resource.data.keys().hasOnly([
+        'teacherUid',
+        'group',
+        'studentId',
+        'studentName',
+        'month',
+        'received',
+        'amount',
+        'createdAt',
+        'updatedAt'
+      ])
+      && (request.resource.data.teacherUid is string)
+      && isPlainText(request.resource.data.group, 1, 80)
+      && (request.resource.data.studentId is string)
+      && isPlainText(request.resource.data.studentName, 1, 140)
+      && isIsoMonthYm(request.resource.data.month)
+      && (monthId == request.resource.data.month)
+      && (request.resource.data.received is bool)
+      && (isNumber(request.resource.data.amount) && request.resource.data.amount >= 0 && request.resource.data.amount <= 10000000)
+      && (request.resource.data.updatedAt is timestamp)
+      && (request.resource.data.updatedAt == request.time);
+    }
+    function isMonthlyFeeCreate(monthId) {
+      return isMonthlyFeePayloadCommon(monthId)
+        && (request.resource.data.createdAt is timestamp)
+        && (request.resource.data.createdAt == request.time);
+    }
+
+    match /student_fees/{studentId} {
+      // Keep the parent document locked down; all data lives in /months.
+      allow read, write: if false;
+
+      match /months/{monthId} {
+        // Admin can view/query all monthly fees.
+        allow get, list: if hasAnyRole(['Admin']);
+
+        // Teacher can view only the monthly fee docs they created.
+        allow get: if hasAnyRole(['Teacher']) && isSignedIn() && resource.data.teacherUid == request.auth.uid;
+
+        // Teacher can create a monthly fee doc only once per student per month, and only for their assigned form-teacher group.
+        allow create: if hasAnyRole(['Teacher'])
+          && isSignedIn()
+          && request.resource.data.teacherUid == request.auth.uid
+          && userProfile().data.farmTeacherGroup == request.resource.data.group
+          && request.resource.data.studentId == studentId
+          && !exists(/databases/$(database)/documents/student_fees/$(studentId)/months/$(monthId))
+          && isMonthlyFeeCreate(monthId);
+
+        // Teachers cannot edit or delete once saved (write-once). Admin can manage.
+        allow update, delete: if hasAnyRole(['Admin']);
+      }
+    }
+
+    // ---------- Institute Students ----------
+    // Collection: /instituteStudents/{studentId}
+    // Admin: full access.
+    // Teacher (form teacher): may read students in their assigned group, and update
+    //   a limited set of info fields (cannot change group, cannot delete/create).
+    match /instituteStudents/{studentId} {
+
+      // Helper: does this teacher have a farmTeacherGroup assigned?
+      function isFormTeacherForGroup() {
+        return isSignedIn()
+          && hasAnyRole(['Teacher'])
+          && userProfileExists()
+          && userProfile().data.get('farmTeacherGroup', null) != null
+          && userProfile().data.farmTeacherGroup != '';
+      }
+
+      // Read: Admin can read all; Teachers can read docs belonging to their group.
+      allow get: if hasAnyRole(['Admin'])
+        || (isFormTeacherForGroup() && resource.data.group == userProfile().data.farmTeacherGroup);
+
+      allow list: if hasAnyRole(['Admin'])
+        || (isFormTeacherForGroup()
+            && request.query.limit <= 2000
+            && 'group' in request.query.filters);
+
+      // Create / Delete: Admin only — teachers cannot add or remove students.
+      allow create, delete: if hasAnyRole(['Admin']);
+
+      // Update: Admin or the form teacher for this student's group.
+      // Teachers may only change these fields (group is intentionally excluded).
+      allow update: if hasAnyRole(['Admin'])
+        || (
+          isFormTeacherForGroup()
+          // Student must belong to teacher's group (and that grouping cannot change)
+          && resource.data.group == userProfile().data.farmTeacherGroup
+          && (
+            !('group' in request.resource.data.diff(resource.data).changedKeys())
+          )
+          // Allow only the specific fields a form teacher should be able to edit
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+            'fullName',
+            'fullNameLC',
+            'parentage',
+            'age',
+            'address',
+            'gender',
+            'attendanceStatus',
+            'attendanceStatusLabel',
+            'attendanceStatusLC',
+            'mode',
+            'phone',
+            'motherPhone',
+            'email',
+            'notes',
+            'gradeClass',
+            'photoPath',
+            'photoUrl',
+            'updatedAt'
+          ])
+        );
+    }
+    // ---------- Star Cards (Student Recognition) ----------
+    
+    function getTeacherGroup() {
+      let p = userProfile().data;
+      return p.get('farmTeacherGroup', p.get('formTeacherGroup', p.get('formGroup', p.get('group', ''))));
+    }
+
+    match /starCards/{groupId} {
+      allow read: if true; // Public leaderboard
+      allow write: if hasAnyRole(['Admin']) || (isSignedIn() && hasAnyRole(['Teacher']) && getTeacherGroup() == groupId);
+    }
+
+    match /starCardHistory/{historyId} {
+      allow read: if true; // Public leaderboard — cumulative points calculation
+      // Any teacher of the group can add history
+      allow create: if hasAnyRole(['Admin']) || (isSignedIn() && request.resource.data.groupName == getTeacherGroup());
+      allow update, delete: if hasAnyRole(['Admin']);
+    }
+    // ---------- Library Page Visits ----------
+    // Records dashboard analytics for library page traffic
+    match /libraryPageVisits/{dateDoc} {
+      allow read: if hasAnyRole(['Admin']) || hasActiveDelegation('canManageLibrary'); 
+      allow create, update: if true; 
+    }
+
+    // ---------- Route Sessions (GPS Live Tracking) ----------
+    match /routeSessions/{sessionId} {
+      allow read, update: if true;
+      allow create: if isSignedIn() && (hasRole('Admin') || hasRole('ProgramOrganizer'));
+      allow delete: if hasRole('Admin') || (isSignedIn() && hasRole('ProgramOrganizer'));
+    }
+
+    // ---------- Referral Leaderboard ----------
+    match /referralLeaderboard/{uid} {
+      allow read: if isSignedIn();
+      allow write: if false; // Only Cloud Functions or Admin (bypassing rules) can write
+    }
+
+    // ---------- Teacher Personal Notes ----------
+    match /teacherNotes/{noteId} {
+      allow read: if isSignedIn();
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.teacherId;
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.teacherId;
+    }
+
+    // ---------- Term Exams & Marks Management ----------
+    match /term_exams/{docId} {
+      allow read: if isSignedIn();
+      allow write: if hasRole('Admin');
+    }
+    match /term_exam_submissions/{docId} {
+      allow read, write: if isSignedIn();
+    }
+    match /term_exam_publish_status/{docId} {
+      allow read: if isSignedIn();
+      allow write: if hasRole('Admin');
+    }
+    // ---------- Page Analytics ----------
+    match /page_analytics/{pageId}/sessions/{sessionId} {
+      allow create: if true;
+      allow read: if hasRole('Admin') || hasRole('ProgramOrganizer') || (
+        isSignedIn() && userProfileExists() && userProfile().data.get('role', '') == 'Volunteer' && userProfile().data.get('organizerPermissions', {}).get('active', false) == true && userProfile().data.get('organizerPermissions', {}).get('canViewAnalytics', false) == true
+      );
+    }
+
+    // ---------- LMS Courses ----------
+    match /courses/{courseId} {
+      allow read, write: if true;
+    }
+  }
+}
