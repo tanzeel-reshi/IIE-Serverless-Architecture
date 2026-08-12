@@ -1,9 +1,5 @@
 # IIE Full-Stack Educational Management Platform — Architecture Showcase
 
-> **University / College Admission Portfolio**
-> A curated, sanitized selection of structural files from a **production** full-stack Islamic educational management system.
-> All credentials, project IDs, domain names, email addresses, phone numbers, physical addresses, and social media links have been replaced with `[YOUR_XXX_HERE]` placeholders. No sensitive data remains.
-
 ---
 
 ## Project Scale at a Glance
