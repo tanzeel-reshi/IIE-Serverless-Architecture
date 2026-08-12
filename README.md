@@ -430,5 +430,3 @@ Content-Security-Policy: [configured per page type]
 | `functions/package.json` | 19 | Backend dependency manifest |
 | `README.md` | This file | Complete architecture documentation |
 
-> **Sanitization**: All sensitive values replaced with `[YOUR_XXX_HERE]` placeholders.
-> A Python leak-detection script was run after sanitization and confirmed zero sensitive patterns remain.
